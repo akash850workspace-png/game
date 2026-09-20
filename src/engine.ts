@@ -31,6 +31,13 @@ export function seededInt(rng: () => number, min: number, max: number): number {
 }
 
 export function seededChoice<T>(rng: () => number, arr: T[]): T {
+  if (arr.length === 0) throw new Error('seededChoice called with empty array');
+  return arr[Math.floor(rng() * arr.length)];
+}
+
+// Safe version that returns null for empty arrays
+export function seededChoiceSafe<T>(rng: () => number, arr: T[]): T | null {
+  if (arr.length === 0) return null;
   return arr[Math.floor(rng() * arr.length)];
 }
 
@@ -296,8 +303,10 @@ export function initSimulation(seed: number): SimulationState {
   const npcArr = Array.from(npcs.values());
   for (const npc of npcArr) {
     const numRel = seededInt(rng, 1, 4);
+    const others = npcArr.filter(n => n.id !== npc.id);
+    if (others.length === 0) continue;
     for (let j = 0; j < numRel; j++) {
-      const other = seededChoice(rng, npcArr.filter(n => n.id !== npc.id));
+      const other = seededChoice(rng, others);
       if (!npc.relationships.find(r => r.targetId === other.id)) {
         npc.relationships.push({
           targetId: other.id,
@@ -701,7 +710,8 @@ function buildActions(): ActionDef[] {
           && other.sex !== npc.sex && Math.abs(other.age - npc.age) < 15;
       });
       if (!goodRel) return null;
-      const target = state.npcs.get(goodRel.targetId)!;
+      const target = state.npcs.get(goodRel.targetId);
+      if (!target || !target.alive) return null;
       npc.spouseId = target.id;
       target.spouseId = npc.id;
       npc.familyLinks.push({ type: 'spouse', npcId: target.id });
@@ -1589,6 +1599,7 @@ function processWorldEvents(state: SimulationState): void {
       }
       case 'plague': {
         const victims = Array.from(state.npcs.values()).filter(n => n.alive);
+        if (victims.length === 0) break;
         const numSick = Math.min(victims.length, seededInt(rng, 5, 20));
         for (let i = 0; i < numSick; i++) {
           const v = seededChoice(rng, victims);
@@ -1600,7 +1611,8 @@ function processWorldEvents(state: SimulationState): void {
       }
       case 'bandit_raid': {
         const victims = Array.from(state.npcs.values()).filter(n => n.alive);
-        const numVictims = seededInt(rng, 3, 10);
+        if (victims.length === 0) break;
+        const numVictims = Math.min(victims.length, seededInt(rng, 3, 10));
         for (let i = 0; i < numVictims; i++) {
           const v = seededChoice(rng, victims);
           v.coin = Math.max(0, v.coin - seededInt(rng, 5, 20));
@@ -1620,6 +1632,7 @@ function processWorldEvents(state: SimulationState): void {
       }
       case 'festival': {
         const participants = Array.from(state.npcs.values()).filter(n => n.alive);
+        if (participants.length === 0) break;
         const numParticipants = Math.min(participants.length, seededInt(rng, 20, 60));
         for (let i = 0; i < numParticipants; i++) {
           const p = seededChoice(rng, participants);
@@ -1673,6 +1686,7 @@ function processWorldEvents(state: SimulationState): void {
       }
       case 'foreign_war': {
         const eligible = Array.from(state.npcs.values()).filter(n => n.alive && n.age > 18 && n.age < 45);
+        if (eligible.length === 0) break;
         const drafted = Math.min(eligible.length, seededInt(rng, 5, 15));
         for (let i = 0; i < drafted; i++) {
           const d = seededChoice(rng, eligible);
@@ -2080,74 +2094,102 @@ export function stepSimulation(state: SimulationState): void {
   const aliveNpcs = Array.from(npcs.values()).filter(n => n.alive);
   
   for (const npc of aliveNpcs) {
-    // Daily needs update
-    updateNPCDaily(npc, state);
-    
-    if (!npc.alive) {
-      logDeath(npc, state);
-      continue;
-    }
-    
-    // Decision: only process NPCs "due" this tick (stagger)
-    // Each NPC acts roughly every 1-3 days
-    if (state.tick - npc.lastActionTick < 1 + Math.floor(rng() * 2)) continue;
-    npc.lastActionTick = state.tick;
-    
-    // Compute pressures
-    const pressures = computePressures(npc, state);
-    
-    // Score available actions
-    const scored: { action: string; score: number; def: ActionDef }[] = [];
-    for (const action of ACTIONS) {
-      if (!action.preconditions(npc, state)) continue;
-      const score = action.utility(npc, pressures, state);
-      if (score > 0.01) {
-        scored.push({ action: action.id, score, def: action });
+    try {
+      // Daily needs update
+      updateNPCDaily(npc, state);
+      
+      if (!npc.alive) {
+        logDeath(npc, state);
+        continue;
       }
-    }
-    
-    if (scored.length === 0) continue;
-    
-    // Select action using softmax with temperature from temper/impulsiveness
-    const temperature = 0.3 + npc.traits.temper * 0.4;
-    const chosenId = softmaxSeeded(scored, temperature, rng);
-    const chosen = scored.find(s => s.action === chosenId);
-    if (!chosen) continue;
-    
-    // Determine success
-    const successChance = chosen.def.successChance(npc, state);
-    const roll = rng();
-    const success = roll < successChance;
-    
-    // Execute action
-    const entry = chosen.def.execute(npc, state, success, rng);
-    if (entry) {
-      entry.causalTrace.tick = state.tick;
-      entry.causalTrace.topAlternatives = scored
-        .filter(s => s.action !== chosenId)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 3)
-        .map(s => ({ action: s.action, score: s.score }));
-      entry.causalTrace.diceRoll = roll;
-      entry.causalTrace.threshold = successChance;
-      state.log.push(entry);
+      
+      // Decision: only process NPCs "due" this tick (stagger)
+      // Each NPC acts roughly every 1-3 days
+      if (state.tick - npc.lastActionTick < 1 + Math.floor(rng() * 2)) continue;
+      npc.lastActionTick = state.tick;
+      
+      // Compute pressures
+      const pressures = computePressures(npc, state);
+      
+      // Score available actions
+      const scored: { action: string; score: number; def: ActionDef }[] = [];
+      for (const action of ACTIONS) {
+        if (!action.preconditions(npc, state)) continue;
+        const score = action.utility(npc, pressures, state);
+        if (score > 0.01) {
+          scored.push({ action: action.id, score, def: action });
+        }
+      }
+      
+      if (scored.length === 0) continue;
+      
+      // Select action using softmax with temperature from temper/impulsiveness
+      const temperature = 0.3 + npc.traits.temper * 0.4;
+      const chosenId = softmaxSeeded(scored, temperature, rng);
+      const chosen = scored.find(s => s.action === chosenId);
+      if (!chosen) continue;
+      
+      // Determine success
+      const successChance = chosen.def.successChance(npc, state);
+      const roll = rng();
+      const success = roll < successChance;
+      
+      // Execute action
+      const entry = chosen.def.execute(npc, state, success, rng);
+      if (entry) {
+        entry.causalTrace.tick = state.tick;
+        entry.causalTrace.topAlternatives = scored
+          .filter(s => s.action !== chosenId)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3)
+          .map(s => ({ action: s.action, score: s.score }));
+        entry.causalTrace.diceRoll = roll;
+        entry.causalTrace.threshold = successChance;
+        state.log.push(entry);
+      }
+    } catch (e) {
+      // Defensive: skip NPC if any error occurs, log it
+      console.warn(`Error processing NPC ${npc.id} (${npc.name}) at tick ${state.tick}:`, e);
+      continue;
     }
   }
   
-  // World events
-  processWorldEvents(state);
+  // World events (with defensive try-catch)
+  try {
+    processWorldEvents(state);
+  } catch (e) {
+    console.warn(`Error in world events at tick ${state.tick}:`, e);
+  }
   
-  // Wildlife
-  processWildlife(state);
+  // Wildlife (with defensive try-catch)
+  try {
+    processWildlife(state);
+  } catch (e) {
+    console.warn(`Error in wildlife at tick ${state.tick}:`, e);
+  }
   
   // Economy
-  if (state.tick % 7 === 0) updateEconomy(state);
+  if (state.tick % 7 === 0) {
+    try {
+      updateEconomy(state);
+    } catch (e) {
+      console.warn(`Error in economy at tick ${state.tick}:`, e);
+    }
+  }
   
   // Story detection
-  detectStories(state);
+  try {
+    detectStories(state);
+  } catch (e) {
+    console.warn(`Error in story detection at tick ${state.tick}:`, e);
+  }
   
   // Stats
-  updateStats(state);
+  try {
+    updateStats(state);
+  } catch (e) {
+    console.warn(`Error in stats at tick ${state.tick}:`, e);
+  }
   
   // Cap population
   const alive = Array.from(npcs.values()).filter(n => n.alive);
@@ -2172,7 +2214,13 @@ export function runSimulation(seed: number, years: number = 100): SimulationStat
   const totalTicks = years * 360;
   
   while (state.tick < totalTicks) {
-    stepSimulation(state);
+    try {
+      stepSimulation(state);
+    } catch (e) {
+      console.error(`Fatal error at tick ${state.tick}:`, e);
+      // Skip this tick and continue
+      state.tick++;
+    }
   }
   
   return state;
@@ -2280,23 +2328,23 @@ export function generateTopStories(state: SimulationState, count: number = 20): 
     allEntries.forEach(e => usedEntries.add(e.id));
     
     // Generate story paragraph
-    const mainNpc = state.npcs.get(entry.npcIds[0]);
+    const mainNpc = entry.npcIds.length > 0 ? state.npcs.get(entry.npcIds[0]) : undefined;
     const year = entry.year;
     
     let paragraph = '';
     if (entry.type === 'murder') {
-      const victim = state.npcs.get(entry.npcIds[1]);
+      const victim = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
       paragraph = `In Year ${year}, ${mainNpc?.name || 'Unknown'} murdered ${victim?.name || 'another'}. `;
       if (related.length > 0) {
         paragraph += `This act of violence was preceded by mounting tension. `;
         paragraph += related.slice(0, 2).map(r => r.entry.text).join(' ');
       }
     } else if (entry.type === 'marry') {
-      const spouse = state.npcs.get(entry.npcIds[1]);
+      const spouse = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
       paragraph = `In Year ${year}, ${mainNpc?.name || 'Unknown'} and ${spouse?.name || 'their partner'} were joined in marriage. `;
       paragraph += `Their union brought hope to the settlement.`;
     } else if (entry.type === 'betray') {
-      const target = state.npcs.get(entry.npcIds[1]);
+      const target = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
       paragraph = `In Year ${year}, trust shattered when ${mainNpc?.name || 'Unknown'} betrayed ${target?.name || 'a companion'}. `;
       paragraph += `The wound of treachery would not heal easily.`;
     } else if (entry.tags.includes('world_event')) {

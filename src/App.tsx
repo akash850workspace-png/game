@@ -36,8 +36,13 @@ function App() {
     
     const runChunk = () => {
       const endTick = Math.min(currentTick + chunkSize, totalTicks);
-      while (simState.tick < endTick) {
-        stepSimulation(simState);
+      try {
+        while (simState.tick < endTick) {
+          stepSimulation(simState);
+        }
+      } catch (e) {
+        console.error(`Error in simulation chunk at tick ${simState.tick}:`, e);
+        simState.tick = endTick; // Skip to end of chunk
       }
       currentTick = endTick;
       setProgress(Math.floor((currentTick / totalTicks) * 100));
@@ -61,10 +66,14 @@ function App() {
     setProgress(0);
     
     setTimeout(() => {
-      const simState = runSimulation(seed, 100);
-      setState(simState);
-      setTopStories(generateTopStories(simState, 20));
-      setHealthFlags(healthCheck(simState));
+      try {
+        const simState = runSimulation(seed, 100);
+        setState(simState);
+        setTopStories(generateTopStories(simState, 20));
+        setHealthFlags(healthCheck(simState));
+      } catch (e) {
+        console.error('Fatal simulation error:', e);
+      }
       setRunning(false);
       setProgress(100);
     }, 50);

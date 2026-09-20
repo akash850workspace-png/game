@@ -189,4 +189,79 @@ export class CausalTracker {
       }))
     };
   }
+  
+  // Find causal parents for a decision
+  // This finds events that changed state relevant to the NPC's decision
+  findCausalParents(npc: NPC, decision: any): string[] {
+    const parentIds: string[] = [];
+    const currentTick = this.state.tick;
+    
+    // Look back through recent events (last 30 days)
+    const lookbackTicks = 30;
+    const startTick = Math.max(0, currentTick - lookbackTicks);
+    
+    for (const [eventId, event] of this.state.events) {
+      if (event.tick < startTick || event.tick >= currentTick) continue;
+      
+      // Check if this event changed state relevant to the NPC
+      const links = this.links.get(eventId);
+      if (!links) continue;
+      
+      for (const link of links) {
+        // Check if the state change affects this NPC
+        if (link.targetId === npc.id.toString()) {
+          // This event changed the NPC's state
+          // Check if it's relevant to the decision
+          if (this.isStateChangeRelevant(link.stateProperty, decision.action)) {
+            if (!parentIds.includes(eventId)) {
+              parentIds.push(eventId);
+            }
+          }
+        }
+        
+        // Also check if event involved NPCs the decision-maker has relationships with
+        if (event.actorIds.includes(npc.id) || event.targetIds.includes(npc.id)) {
+          if (!parentIds.includes(eventId)) {
+            parentIds.push(eventId);
+          }
+        }
+      }
+    }
+    
+    // Also add events from NPC's memories
+    for (const memory of npc.memories) {
+      const memoryEvent = this.state.events.get(memory.eventId);
+      if (memoryEvent && memoryEvent.tick >= startTick) {
+        if (!parentIds.includes(memory.eventId)) {
+          parentIds.push(memory.eventId);
+        }
+      }
+    }
+    
+    // Limit to most relevant parents (top 5 by recency and relevance)
+    return parentIds
+      .map(id => ({
+        id,
+        tick: this.state.events.get(id)?.tick || 0
+      }))
+      .sort((a, b) => b.tick - a.tick)
+      .slice(0, 5)
+      .map(p => p.id);
+  }
+  
+  // Check if a state change is relevant to a specific action
+  private isStateChangeRelevant(property: string, action: string): boolean {
+    const relevanceMap: Record<string, string[]> = {
+      'coin': ['work', 'eat', 'steal', 'buy', 'trade', 'borrow'],
+      'health': ['fight', 'heal', 'rest', 'work'],
+      'hunger': ['eat', 'work', 'steal', 'beg'],
+      'rest': ['sleep', 'work', 'socialize'],
+      'affinity': ['socialize', 'fight', 'help', 'betray'],
+      'trust': ['trade', 'lend', 'borrow', 'betray'],
+      'reputation': ['work', 'crime', 'help', 'fight']
+    };
+    
+    const relevantActions = relevanceMap[property] || [];
+    return relevantActions.includes(action);
+  }
 }

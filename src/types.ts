@@ -358,6 +358,12 @@ export interface WorldState {
   nextEventId: number;
   nextStoryId: number;
   nextMissionId: number;
+  
+  // Core systems (lazy imports to avoid circular dependencies)
+  causalTracker: any;
+  decisionAnalyzer: any;
+  indexes: any;
+  knowledgeSystem: any;
 }
 
 export interface Location {

@@ -53,9 +53,70 @@ export function computePressures(npc: NPC, state: WorldState): Pressures {
   const avgReputation = Object.values(npc.reputation).reduce((a, b) => a + b, 0) / 4;
   pressures.statusNeed = npc.traits.ambition * (1 - avgReputation);
 
-  // Calculate vengeance from memories
+  // Calculate vengeance from memories - MEMORY INTEGRATION
   const grievances = npc.memories.filter(m => m.valence < -0.5);
   pressures.vengeance = Math.min(1, grievances.length * 0.2 * npc.traits.temper);
+  
+  // Memory-based pressure modifications
+  for (const memory of npc.memories) {
+    const event = state.events.get(memory.eventId);
+    if (!event) continue;
+    
+    // Theft memories increase caution and vengeance
+    if (event.type === 'theft' && event.targetIds.includes(npc.id)) {
+      pressures.safety = Math.min(1, pressures.safety + memory.salience * 0.2);
+      pressures.vengeance = Math.min(1, pressures.vengeance + Math.abs(memory.valence) * 0.3);
+    }
+    
+    // Violence memories increase fear
+    if ((event.type === 'fight' || event.type === 'assault') && event.targetIds.includes(npc.id)) {
+      pressures.safety = Math.min(1, pressures.safety + memory.salience * 0.3);
+    }
+    
+    // Positive social memories reduce loneliness
+    if (event.type === 'socialize' && event.actorIds.includes(npc.id)) {
+      pressures.belonging = Math.max(0, pressures.belonging - memory.salience * 0.1);
+    }
+    
+    // Economic success/failure memories affect wealth need
+    if (event.type === 'work' && event.actorIds.includes(npc.id)) {
+      const coinChange = event.stateChanges.find(c => c.property === 'coin');
+      if (coinChange && coinChange.delta && coinChange.delta < 0) {
+        pressures.wealthNeed = Math.min(1, pressures.wealthNeed + memory.salience * 0.2);
+      }
+    }
+  }
+  
+  // GOAL INTEGRATION: Active goals influence pressures
+  for (const goal of npc.goals) {
+    if (goal.completed) continue;
+    
+    // Revenge goals increase vengeance pressure
+    if (goal.type === 'revenge') {
+      pressures.vengeance = Math.min(1, pressures.vengeance + goal.priority * 0.4);
+    }
+    
+    // Debt repayment goals increase wealth need
+    if (goal.type === 'repay_debt') {
+      pressures.wealthNeed = Math.min(1, pressures.wealthNeed + goal.priority * 0.3);
+      pressures.debt = Math.min(1, pressures.debt + goal.priority * 0.2);
+    }
+    
+    // Accumulate wealth goals increase wealth need
+    if (goal.type === 'accumulate_wealth') {
+      pressures.wealthNeed = Math.min(1, pressures.wealthNeed + goal.priority * 0.2);
+    }
+    
+    // Find love goals increase belonging need
+    if (goal.type === 'find_love') {
+      pressures.belonging = Math.min(1, pressures.belonging + goal.priority * 0.3);
+    }
+    
+    // Gain status goals increase status need
+    if (goal.type === 'gain_status') {
+      pressures.statusNeed = Math.min(1, pressures.statusNeed + goal.priority * 0.3);
+    }
+  }
 
   // Calculate faction loyalty
   if (npc.faction) {

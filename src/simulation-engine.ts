@@ -6,6 +6,10 @@ import type { WorldState, NPC, SimEvent, Location, EconomyState, WildlifeState, 
 import { makeDecision, applyStateChanges, applyRelationshipChanges, applyMemoryCreations, updatePerception, updateGoals, createEvent } from './causal-engine';
 import { detectStoryThreads, generateMissions } from './story-engine';
 import { exportSimulation, downloadExport, generateEventLog, generateCausalChains, generateEmergentHistory } from './export-system';
+import { CausalTracker } from './core/causal-tracker';
+import { DecisionAnalyzer } from './core/decision-analyzer';
+import { Indexes } from './core/indexes';
+import { KnowledgeSystem } from './core/knowledge-system';
 
 // ============================================================
 // SEEDED RANDOM NUMBER GENERATOR
@@ -67,8 +71,19 @@ export function initializeWorld(seed: number, population: number = 150): WorldSt
     nextNpcId: 1,
     nextEventId: 1,
     nextStoryId: 1,
-    nextMissionId: 1
+    nextMissionId: 1,
+    // Core systems
+    causalTracker: null as any,
+    decisionAnalyzer: null as any,
+    indexes: null as any,
+    knowledgeSystem: null as any
   };
+  
+  // Initialize core systems
+  state.causalTracker = new CausalTracker(state);
+  state.decisionAnalyzer = new DecisionAnalyzer(state);
+  state.indexes = new Indexes(state);
+  state.knowledgeSystem = new KnowledgeSystem(state);
   
   // Initialize locations
   initializeLocations(state);
@@ -83,6 +98,9 @@ export function initializeWorld(seed: number, population: number = 150): WorldSt
   
   // Initialize wildlife
   initializeWildlife(state);
+  
+  // Rebuild indexes after initialization
+  state.indexes = new Indexes(state);
   
   return state;
 }
@@ -229,8 +247,19 @@ function createInitialNPC(state: WorldState): NPC {
 // ============================================================
 
 export function stepSimulation(state: WorldState): void {
-  // Update each living NPC
-  const aliveNPCs = Array.from(state.npcs.values()).filter(n => n.alive);
+  // Take snapshot for causal tracking
+  if (state.causalTracker) {
+    state.causalTracker.takeSnapshot(state.tick);
+  }
+  
+  // Update each living NPC - use indexes for performance
+  const aliveNPCs = state.indexes 
+    ? state.indexes.getNPCsInDistrict('market').concat(
+        state.indexes.getNPCsInDistrict('farms'),
+        state.indexes.getNPCsInDistrict('docks'),
+        state.indexes.getNPCsInDistrict('old_quarter')
+      ).map((id: number) => state.npcs.get(id)).filter((n: NPC | undefined): n is NPC => n !== undefined && n.alive)
+    : Array.from(state.npcs.values()).filter(n => n.alive);
   
   for (const npc of aliveNPCs) {
     // Daily needs update
@@ -250,20 +279,58 @@ export function stepSimulation(state: WorldState): void {
       const decision = makeDecision(npc, state, actions);
       
       if (decision) {
-        // Create event
+        // Find causal parents using causal tracker
+        const parentIds = state.causalTracker 
+          ? state.causalTracker.findCausalParents(npc, decision)
+          : [];
+        
+        // Create event with causal parents
         const event = createEvent(
           state,
           decision.action,
           [npc.id],
           [],
           decision.result,
-          decision
+          decision,
+          parentIds
         );
+        
+        // Analyze decision for explanation
+        if (state.decisionAnalyzer) {
+          const breakdown = state.decisionAnalyzer.analyzeDecision(
+            npc,
+            decision.action,
+            decision.pressures,
+            new Map([[decision.action, decision.score]])
+          );
+          (event as any).decisionBreakdown = breakdown;
+        }
         
         // Apply state changes
         applyStateChanges(state, decision.result.stateChanges);
         applyRelationshipChanges(state, decision.result.relationshipChanges);
         applyMemoryCreations(state, decision.result.memoryCreations);
+        
+        // Track state changes for causal tracking
+        if (state.causalTracker) {
+          for (const change of decision.result.stateChanges) {
+            state.causalTracker.trackStateChange(
+              event.id,
+              change.property,
+              change.targetId,
+              change.oldValue,
+              change.newValue
+            );
+          }
+          
+          // Link this event to decisions it affected
+          state.causalTracker.linkToDecision(event.id, event.id);
+        }
+        
+        // Update indexes
+        if (state.indexes) {
+          state.indexes.addEvent(event);
+        }
         
         // Update perception
         updatePerception(state, event);
@@ -296,6 +363,11 @@ export function stepSimulation(state: WorldState): void {
   
   // Economy
   updateEconomy(state);
+  
+  // Knowledge propagation - spread information through social networks
+  if (state.knowledgeSystem && state.tick % 5 === 0) {
+    state.knowledgeSystem.spreadKnowledge();
+  }
   
   // Story detection
   if (state.tick % 30 === 0) {
@@ -545,6 +617,10 @@ function getAvailableActions(npc: NPC, state: WorldState): ActionDefinition[] {
     socializeAction,
     stealAction,
     fightAction,
+    helpAction,
+    betrayAction,
+    lendAction,
+    borrowAction,
     // Add more actions as needed
   ];
 }
@@ -713,11 +789,20 @@ const stealAction: ActionDefinition = {
   utility: (npc, pressures) => pressures.wealthNeed * 0.5 + (1 - npc.traits.honesty) * 0.3,
   successChance: (npc) => 0.3 + npc.skills.stealth * 0.005,
   execute: (npc, state, success) => {
-    const targets = Array.from(state.npcs.values()).filter(
-      n => n.alive && n.id !== npc.id && n.coin > 10
-    );
+    // Use indexes for performance if available
+    let candidates: NPC[];
+    if (state.indexes) {
+      const npcIds = state.indexes.getNPCsInDistrict(npc.district);
+      candidates = npcIds
+        .map((id: number) => state.npcs.get(id))
+        .filter((n: NPC | undefined): n is NPC => n !== undefined && n.alive && n.id !== npc.id && n.coin > 10);
+    } else {
+      candidates = Array.from(state.npcs.values()).filter(
+        n => n.alive && n.id !== npc.id && n.coin > 10 && n.district === npc.district
+      );
+    }
     
-    if (targets.length === 0) {
+    if (candidates.length === 0) {
       return {
         stateChanges: [],
         relationshipChanges: [],
@@ -728,10 +813,26 @@ const stealAction: ActionDefinition = {
       };
     }
     
-    const target = targets[Math.floor(state.rng() * targets.length)];
+    // RELATIONSHIP INTEGRATION: Prefer targets with low trust
+    // Sort by trust (ascending) - prefer to steal from those we don't trust
+    const targets = candidates.sort((a, b) => {
+      const relA = npc.relationships.get(a.id);
+      const relB = npc.relationships.get(b.id);
+      const trustA = relA ? relA.trust : 0;
+      const trustB = relB ? relB.trust : 0;
+      return trustA - trustB; // Lower trust first
+    });
+    
+    // Choose from top 3 lowest-trust targets (with some randomness)
+    const topTargets = targets.slice(0, Math.min(3, targets.length));
+    const target = topTargets[Math.floor(state.rng() * topTargets.length)];
     
     if (success) {
       const amount = 5 + Math.floor(state.rng() * 15);
+      
+      // RELATIONSHIP CHANGE: Stealing damages trust
+      const currentRel = npc.relationships.get(target.id);
+      const currentTrust = currentRel ? currentRel.trust : 0;
       
       return {
         stateChanges: [{
@@ -749,7 +850,15 @@ const stealAction: ActionDefinition = {
           newValue: target.coin - amount,
           delta: -amount
         }],
-        relationshipChanges: [],
+        relationshipChanges: [{
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'trust',
+          oldValue: currentTrust,
+          newValue: Math.max(-1, currentTrust - 0.5),
+          delta: -0.5,
+          reason: 'stole from'
+        }],
         memoryCreations: [{
           npcId: target.id,
           eventId: '', // Will be filled in
@@ -782,11 +891,20 @@ const fightAction: ActionDefinition = {
   utility: (npc, pressures) => pressures.vengeance * 0.5 + npc.traits.temper * 0.3,
   successChance: (npc) => 0.3 + npc.skills.fighting * 0.005,
   execute: (npc, state, success) => {
-    const targets = Array.from(state.npcs.values()).filter(
-      n => n.alive && n.id !== npc.id && n.district === npc.district
-    );
+    // Use indexes for performance if available
+    let candidates: NPC[];
+    if (state.indexes) {
+      const npcIds = state.indexes.getNPCsInDistrict(npc.district);
+      candidates = npcIds
+        .map((id: number) => state.npcs.get(id))
+        .filter((n: NPC | undefined): n is NPC => n !== undefined && n.alive && n.id !== npc.id);
+    } else {
+      candidates = Array.from(state.npcs.values()).filter(
+        n => n.alive && n.id !== npc.id && n.district === npc.district
+      );
+    }
     
-    if (targets.length === 0) {
+    if (candidates.length === 0) {
       return {
         stateChanges: [],
         relationshipChanges: [],
@@ -797,10 +915,37 @@ const fightAction: ActionDefinition = {
       };
     }
     
-    const target = targets[Math.floor(state.rng() * targets.length)];
+    // RELATIONSHIP + MEMORY INTEGRATION: Prefer targets with low affinity or resentment
+    // Also consider revenge goals
+    const targets = candidates.sort((a, b) => {
+      const relA = npc.relationships.get(a.id);
+      const relB = npc.relationships.get(b.id);
+      const affinityA = relA ? relA.affinity : 0;
+      const affinityB = relB ? relB.affinity : 0;
+      const resentmentA = relA ? relA.resentment : 0;
+      const resentmentB = relB ? relB.resentment : 0;
+      
+      // Check if NPC has revenge goal against them
+      const revengeA = npc.goals.some(g => g.type === 'revenge' && g.targetId === a.id);
+      const revengeB = npc.goals.some(g => g.type === 'revenge' && g.targetId === b.id);
+      
+      // Score: lower affinity + higher resentment + revenge goal = higher priority
+      const scoreA = -affinityA + resentmentA * 2 + (revengeA ? 1 : 0);
+      const scoreB = -affinityB + resentmentB * 2 + (revengeB ? 1 : 0);
+      
+      return scoreB - scoreA; // Higher score first
+    });
+    
+    // Choose from top 3 highest-priority targets
+    const topTargets = targets.slice(0, Math.min(3, targets.length));
+    const target = topTargets[Math.floor(state.rng() * topTargets.length)];
     
     if (success) {
       const damage = 0.1 + state.rng() * 0.2;
+      
+      // RELATIONSHIP CHANGE: Fighting damages affinity
+      const currentRel = npc.relationships.get(target.id);
+      const currentAffinity = currentRel ? currentRel.affinity : 0;
       
       return {
         stateChanges: [{
@@ -815,12 +960,26 @@ const fightAction: ActionDefinition = {
           npc1Id: npc.id,
           npc2Id: target.id,
           property: 'affinity',
-          oldValue: 0,
-          newValue: -0.4,
+          oldValue: currentAffinity,
+          newValue: Math.max(-1, currentAffinity - 0.4),
           delta: -0.4,
           reason: 'fought'
         }],
-        memoryCreations: [],
+        memoryCreations: [{
+          npcId: npc.id,
+          eventId: '', // Will be filled in
+          valence: -0.3,
+          salience: 0.6,
+          confidence: 1.0,
+          source: 'witnessed'
+        }, {
+          npcId: target.id,
+          eventId: '', // Will be filled in
+          valence: -0.6,
+          salience: 0.8,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
         description: `${npc.name} fought ${target.name} and dealt damage`,
         salience: 0.5,
         tags: ['violence', 'fight']
@@ -838,10 +997,459 @@ const fightAction: ActionDefinition = {
           delta: -damage
         }],
         relationshipChanges: [],
-        memoryCreations: [],
+        memoryCreations: [{
+          npcId: npc.id,
+          eventId: '', // Will be filled in
+          valence: -0.4,
+          salience: 0.7,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
         description: `${npc.name} fought ${target.name} but took damage`,
         salience: 0.4,
         tags: ['violence', 'fight']
+      };
+    }
+  }
+};
+
+const helpAction: ActionDefinition = {
+  id: 'help',
+  name: 'Help',
+  preconditions: (npc) => npc.alive && npc.traits.empathy > 0.5,
+  utility: (npc, pressures) => npc.traits.empathy * 0.4 + pressures.belonging * 0.3,
+  successChance: () => 0.85,
+  execute: (npc, state, success) => {
+    // Find someone in need
+    const candidates = state.indexes
+      ? state.indexes.getNPCsInDistrict(npc.district)
+          .map((id: number) => state.npcs.get(id))
+          .filter((n: NPC | undefined): n is NPC => 
+            n !== undefined && n.alive && n.id !== npc.id && 
+            (n.health < 0.5 || n.hunger > 0.7 || n.coin < 10)
+          )
+      : Array.from(state.npcs.values()).filter(
+          n => n.alive && n.id !== npc.id && n.district === npc.district &&
+               (n.health < 0.5 || n.hunger > 0.7 || n.coin < 10)
+        );
+    
+    if (candidates.length === 0) {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} wanted to help but found no one in need`,
+        salience: 0.1,
+        tags: ['social', 'attempted']
+      };
+    }
+    
+    // Prefer helping friends and family
+    const target = candidates.sort((a: NPC, b: NPC) => {
+      const relA = npc.relationships.get(a.id);
+      const relB = npc.relationships.get(b.id);
+      const affinityA = relA ? relA.affinity : 0;
+      const affinityB = relB ? relB.affinity : 0;
+      return affinityB - affinityA; // Higher affinity first
+    })[0];
+    
+    if (success) {
+      const helpAmount = Math.floor(state.rng() * 10) + 5;
+      
+      // Determine what kind of help
+      let helpType = 'general';
+      let stateChanges: any[] = [];
+      
+      if (target.hunger > 0.7 && npc.coin >= helpAmount) {
+        helpType = 'food';
+        stateChanges = [
+          {
+            type: 'npc',
+            targetId: npc.id.toString(),
+            property: 'coin',
+            oldValue: npc.coin,
+            newValue: npc.coin - helpAmount,
+            delta: -helpAmount
+          },
+          {
+            type: 'npc',
+            targetId: target.id.toString(),
+            property: 'hunger',
+            oldValue: target.hunger,
+            newValue: Math.max(0, target.hunger - 0.4),
+            delta: -0.4
+          }
+        ];
+      } else if (target.health < 0.5 && npc.coin >= helpAmount) {
+        helpType = 'medical';
+        stateChanges = [
+          {
+            type: 'npc',
+            targetId: npc.id.toString(),
+            property: 'coin',
+            oldValue: npc.coin,
+            newValue: npc.coin - helpAmount,
+            delta: -helpAmount
+          },
+          {
+            type: 'npc',
+            targetId: target.id.toString(),
+            property: 'health',
+            oldValue: target.health,
+            newValue: Math.min(1, target.health + 0.2),
+            delta: 0.2
+          }
+        ];
+      } else {
+        helpType = 'financial';
+        stateChanges = [
+          {
+            type: 'npc',
+            targetId: npc.id.toString(),
+            property: 'coin',
+            oldValue: npc.coin,
+            newValue: npc.coin - helpAmount,
+            delta: -helpAmount
+          },
+          {
+            type: 'npc',
+            targetId: target.id.toString(),
+            property: 'coin',
+            oldValue: target.coin,
+            newValue: target.coin + helpAmount,
+            delta: helpAmount
+          }
+        ];
+      }
+      
+      // Relationship improvement
+      const currentRel = npc.relationships.get(target.id);
+      const currentAffinity = currentRel ? currentRel.affinity : 0;
+      const currentTrust = currentRel ? currentRel.trust : 0;
+      
+      return {
+        stateChanges,
+        relationshipChanges: [{
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'affinity',
+          oldValue: currentAffinity,
+          newValue: Math.min(1, currentAffinity + 0.3),
+          delta: 0.3,
+          reason: 'helped'
+        }, {
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'trust',
+          oldValue: currentTrust,
+          newValue: Math.min(1, currentTrust + 0.2),
+          delta: 0.2,
+          reason: 'helped'
+        }],
+        memoryCreations: [{
+          npcId: target.id,
+          eventId: '',
+          valence: 0.7,
+          salience: 0.7,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
+        description: `${npc.name} helped ${target.name} with ${helpType} (${helpAmount} coin)`,
+        salience: 0.4,
+        tags: ['social', 'help']
+      };
+    } else {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} tried to help ${target.name} but failed`,
+        salience: 0.2,
+        tags: ['social', 'attempted']
+      };
+    }
+  }
+};
+
+const betrayAction: ActionDefinition = {
+  id: 'betray',
+  name: 'Betray',
+  preconditions: (npc) => npc.alive && npc.traits.honesty < 0.4 && npc.relationships.size > 0,
+  utility: (npc, pressures) => (1 - npc.traits.loyalty) * 0.4 + pressures.wealthNeed * 0.3 + npc.traits.greed * 0.3,
+  successChance: (npc) => 0.4 + npc.traits.cunning * 0.004,
+  execute: (npc, state, success) => {
+    // Find someone who trusts us
+    const candidates = Array.from(npc.relationships.entries())
+      .filter(([_, rel]) => rel.trust > 0.3)
+      .map(([id]) => state.npcs.get(id))
+      .filter((n): n is NPC => n !== undefined && n.alive && n.coin > 20);
+    
+    if (candidates.length === 0) {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} considered betrayal but found no suitable target`,
+        salience: 0.2,
+        tags: ['crime', 'attempted']
+      };
+    }
+    
+    const target = candidates[Math.floor(state.rng() * candidates.length)];
+    
+    if (success) {
+      const stolenAmount = Math.floor(target.coin * 0.3);
+      
+      // Destroy relationship
+      const currentRel = npc.relationships.get(target.id);
+      const currentAffinity = currentRel ? currentRel.affinity : 0;
+      const currentTrust = currentRel ? currentRel.trust : 0;
+      
+      return {
+        stateChanges: [{
+          type: 'npc',
+          targetId: npc.id.toString(),
+          property: 'coin',
+          oldValue: npc.coin,
+          newValue: npc.coin + stolenAmount,
+          delta: stolenAmount
+        }, {
+          type: 'npc',
+          targetId: target.id.toString(),
+          property: 'coin',
+          oldValue: target.coin,
+          newValue: target.coin - stolenAmount,
+          delta: -stolenAmount
+        }],
+        relationshipChanges: [{
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'affinity',
+          oldValue: currentAffinity,
+          newValue: Math.max(-1, currentAffinity - 0.8),
+          delta: -0.8,
+          reason: 'betrayed'
+        }, {
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'trust',
+          oldValue: currentTrust,
+          newValue: Math.max(-1, currentTrust - 0.9),
+          delta: -0.9,
+          reason: 'betrayed'
+        }],
+        memoryCreations: [{
+          npcId: target.id,
+          eventId: '',
+          valence: -0.9,
+          salience: 0.95,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
+        description: `${npc.name} betrayed ${target.name} and stole ${stolenAmount} coin`,
+        salience: 0.7,
+        tags: ['crime', 'betrayal']
+      };
+    } else {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} attempted to betray ${target.name} but was discovered`,
+        salience: 0.5,
+        tags: ['crime', 'attempted']
+      };
+    }
+  }
+};
+
+const lendAction: ActionDefinition = {
+  id: 'lend',
+  name: 'Lend Money',
+  preconditions: (npc) => npc.alive && npc.coin > 30,
+  utility: (npc, pressures) => npc.traits.empathy * 0.3 + npc.traits.greed * 0.2,
+  successChance: () => 0.9,
+  execute: (npc, state, success) => {
+    // Find someone in need
+    const candidates = Array.from(state.npcs.values()).filter(
+      n => n.alive && n.id !== npc.id && n.coin < 10 && n.district === npc.district
+    );
+    
+    if (candidates.length === 0) {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} wanted to lend money but found no one in need`,
+        salience: 0.1,
+        tags: ['economic', 'attempted']
+      };
+    }
+    
+    // Prefer lending to friends
+    const target = candidates.sort((a, b) => {
+      const relA = npc.relationships.get(a.id);
+      const relB = npc.relationships.get(b.id);
+      const affinityA = relA ? relA.affinity : 0;
+      const affinityB = relB ? relB.affinity : 0;
+      return affinityB - affinityA;
+    })[0];
+    
+    const loanAmount = Math.min(20, Math.floor(npc.coin * 0.3));
+    
+    if (success) {
+      // Create debt
+      target.debts.push({
+        creditorId: npc.id,
+        amount: Math.floor(loanAmount * 1.2), // 20% interest
+        dueTick: state.tick + 90, // Due in 90 days
+        eventId: '' // Will be filled
+      });
+      
+      const currentRel = npc.relationships.get(target.id);
+      const currentTrust = currentRel ? currentRel.trust : 0;
+      
+      return {
+        stateChanges: [{
+          type: 'npc',
+          targetId: npc.id.toString(),
+          property: 'coin',
+          oldValue: npc.coin,
+          newValue: npc.coin - loanAmount,
+          delta: -loanAmount
+        }, {
+          type: 'npc',
+          targetId: target.id.toString(),
+          property: 'coin',
+          oldValue: target.coin,
+          newValue: target.coin + loanAmount,
+          delta: loanAmount
+        }],
+        relationshipChanges: [{
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'trust',
+          oldValue: currentTrust,
+          newValue: Math.min(1, currentTrust + 0.2),
+          delta: 0.2,
+          reason: 'lent money'
+        }],
+        memoryCreations: [{
+          npcId: target.id,
+          eventId: '',
+          valence: 0.5,
+          salience: 0.7,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
+        description: `${npc.name} lent ${loanAmount} coin to ${target.name}`,
+        salience: 0.3,
+        tags: ['economic', 'debt']
+      };
+    } else {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} offered to lend money to ${target.name} but they refused`,
+        salience: 0.2,
+        tags: ['economic', 'attempted']
+      };
+    }
+  }
+};
+
+const borrowAction: ActionDefinition = {
+  id: 'borrow',
+  name: 'Borrow Money',
+  preconditions: (npc) => npc.alive && npc.coin < 15 && npc.debts.length < 3,
+  utility: (npc, pressures) => pressures.wealthNeed * 0.6 + pressures.hunger * 0.4,
+  successChance: (npc) => 0.3 + npc.traits.honesty * 0.003,
+  execute: (npc, state, success) => {
+    // Find wealthy NPCs
+    const candidates = Array.from(state.npcs.values()).filter(
+      n => n.alive && n.id !== npc.id && n.coin > 50 && n.district === npc.district
+    );
+    
+    if (candidates.length === 0) {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} wanted to borrow money but found no one wealthy enough`,
+        salience: 0.1,
+        tags: ['economic', 'attempted']
+      };
+    }
+    
+    // Prefer borrowing from friends
+    const target = candidates.sort((a, b) => {
+      const relA = npc.relationships.get(a.id);
+      const relB = npc.relationships.get(b.id);
+      const affinityA = relA ? relA.affinity : 0;
+      const affinityB = relB ? relB.affinity : 0;
+      return affinityB - affinityA;
+    })[0];
+    
+    const loanAmount = Math.min(15, Math.floor(target.coin * 0.2));
+    
+    if (success) {
+      // Create debt
+      npc.debts.push({
+        creditorId: target.id,
+        amount: Math.floor(loanAmount * 1.2), // 20% interest
+        dueTick: state.tick + 90, // Due in 90 days
+        eventId: '' // Will be filled
+      });
+      
+      const currentRel = npc.relationships.get(target.id);
+      const currentTrust = currentRel ? currentRel.trust : 0;
+      
+      return {
+        stateChanges: [{
+          type: 'npc',
+          targetId: npc.id.toString(),
+          property: 'coin',
+          oldValue: npc.coin,
+          newValue: npc.coin + loanAmount,
+          delta: loanAmount
+        }, {
+          type: 'npc',
+          targetId: target.id.toString(),
+          property: 'coin',
+          oldValue: target.coin,
+          newValue: target.coin - loanAmount,
+          delta: -loanAmount
+        }],
+        relationshipChanges: [{
+          npc1Id: npc.id,
+          npc2Id: target.id,
+          property: 'trust',
+          oldValue: currentTrust,
+          newValue: Math.min(1, currentTrust + 0.1),
+          delta: 0.1,
+          reason: 'borrowed money'
+        }],
+        memoryCreations: [{
+          npcId: npc.id,
+          eventId: '',
+          valence: 0.3,
+          salience: 0.6,
+          confidence: 1.0,
+          source: 'witnessed'
+        }],
+        description: `${npc.name} borrowed ${loanAmount} coin from ${target.name}`,
+        salience: 0.3,
+        tags: ['economic', 'debt']
+      };
+    } else {
+      return {
+        stateChanges: [],
+        relationshipChanges: [],
+        memoryCreations: [],
+        description: `${npc.name} asked ${target.name} for a loan but was refused`,
+        salience: 0.2,
+        tags: ['economic', 'attempted']
       };
     }
   }

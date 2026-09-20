@@ -624,12 +624,7 @@ function buildActions(): ActionDef[] {
         state.economy.supply.food += foodProduced;
       }
       
-      const trace = makeTrace(npc, 'work', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('work', rng), { npc: npc.name, job: npc.job, district: npc.district });
-      // Only log work occasionally (not every time)
-      if (rng() < 0.1) {
-        return createLogEntry(state, 'work', text, [npc.id], trace, 0.1);
-      }
+      // Never log routine work
       return null;
     }
   });
@@ -663,17 +658,12 @@ function buildActions(): ActionDef[] {
         npc.hunger = Math.max(0, npc.hunger - 0.5);
         npc.health = Math.min(1, npc.health + 0.02);
       }
-      const trace = makeTrace(npc, 'eat', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('eat', rng), { npc: npc.name });
-      // Only log eating if it was significant (was starving)
-      if (wasStarving && ate) {
-        return createLogEntry(state, 'eat', text, [npc.id], trace, 0.15, ['survival']);
-      }
-      return null; // Routine eating not logged
+      // Never log routine eating - only log if starving (already handled above)
+      return null;
     }
   });
 
-  // SLEEP - routine, rarely logged
+  // SLEEP - routine, never logged
   actions.push({
     id: 'sleep',
     preconditions: (npc) => npc.alive && npc.rest > 0.4,
@@ -682,8 +672,7 @@ function buildActions(): ActionDef[] {
     execute: (npc, state, success, rng) => {
       npc.rest = Math.max(0, npc.rest - 0.6);
       npc.health = Math.min(1, npc.health + 0.03);
-      // Don't log sleep - it's routine
-      return null;
+      return null; // Never log routine sleep
     }
   });
 
@@ -705,7 +694,7 @@ function buildActions(): ActionDef[] {
     }
   });
 
-  // GOSSIP
+  // GOSSIP - routine, never logged
   actions.push({
     id: 'gossip',
     preconditions: (npc) => npc.alive,
@@ -718,9 +707,7 @@ function buildActions(): ActionDef[] {
       adjustReputation(target, 'Guards', -0.05);
       adjustReputation(target, 'Merchant Guild', -0.03);
       addMemory(npc, { eventId: `gossip_${state.tick}`, valence: -0.2, salience: 0.3, confidence: 0.6, source: 'inferred', tick: state.tick });
-      const trace = makeTrace(npc, 'gossip', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('gossip', rng), { npc: npc.name, target: target.name });
-      return createLogEntry(state, 'gossip', text, [npc.id, target.id], trace, 0.2);
+      return null; // Never log routine gossip
     }
   });
 
@@ -809,7 +796,8 @@ function buildActions(): ActionDef[] {
     successChance: (npc) => clamp(0.3 + npc.skills.fighting * 0.005 + npc.traits.courage * 0.1, 0.05, 0.95),
     execute: (npc, state, success, rng) => {
       const target = findNearbyNPC(npc, state, rng);
-      if (!target) return null;
+      // Child protection: cannot fight children
+      if (!target || target.age < 14) return null;
       if (success) {
         target.health -= seededRandom(rng, 0.1, 0.3);
         reinforceRelationship(npc, target.id, -0.4, -0.3, state.tick);
@@ -837,7 +825,7 @@ function buildActions(): ActionDef[] {
     utility: (npc, p) => p.hunger * 0.5 + p.poverty * 0.4 + npc.traits.greed * 0.3 + (1 - npc.traits.honesty) * 0.3 - p.fear * 0.5,
     successChance: (npc) => clamp(0.3 + npc.skills.stealth * 0.005 - npc.traits.honesty * 0.1, 0.05, 0.9),
     execute: (npc, state, success, rng) => {
-      const target = findTarget(npc, state, rng, t => t.coin > 5);
+      const target = findTarget(npc, state, rng, t => t.coin > 5 && t.age >= 14);
       if (!target) return null;
       const amount = seededInt(rng, 3, 15);
       if (success) {
@@ -871,7 +859,7 @@ function buildActions(): ActionDef[] {
     successChance: (npc) => clamp(0.2 + npc.skills.stealth * 0.006, 0.05, 0.85),
     execute: (npc, state, success, rng) => {
       const target = findNearbyNPC(npc, state, rng);
-      if (!target) return null;
+      if (!target || target.age < 14) return null;
       const amount = seededInt(rng, 2, 8);
       if (success) {
         target.coin = Math.max(0, target.coin - amount);
@@ -893,7 +881,7 @@ function buildActions(): ActionDef[] {
     utility: (npc, p) => p.poverty * 0.5 + npc.traits.greed * 0.3 + npc.traits.cunning * 0.2,
     successChance: (npc) => clamp(0.25 + npc.skills.stealth * 0.005 + npc.skills.crafting * 0.002, 0.05, 0.8),
     execute: (npc, state, success, rng) => {
-      const target = findTarget(npc, state, rng, t => t.coin > 20);
+      const target = findTarget(npc, state, rng, t => t.coin > 20 && t.age >= 14);
       if (!target) return null;
       if (success) {
         const amount = seededInt(rng, 10, 40);
@@ -917,7 +905,7 @@ function buildActions(): ActionDef[] {
     successChance: (npc) => clamp(0.3 + npc.skills.fighting * 0.004 - 0.1, 0.05, 0.8),
     execute: (npc, state, success, rng) => {
       const target = findNearbyNPC(npc, state, rng);
-      if (!target) return null;
+      if (!target || target.age < 14) return null;
       if (success) {
         const amount = seededInt(rng, 5, 25);
         target.coin = Math.max(0, target.coin - amount);
@@ -964,7 +952,7 @@ function buildActions(): ActionDef[] {
     utility: (npc, p) => npc.traits.cunning * 0.4 + npc.traits.greed * 0.3 + p.poverty * 0.3,
     successChance: (npc) => clamp(0.2 + npc.skills.persuasion * 0.004 + npc.traits.cunning * 0.2, 0.05, 0.7),
     execute: (npc, state, success, rng) => {
-      const target = findTarget(npc, state, rng, t => t.crimes.length > 0 || t.coin > 30);
+      const target = findTarget(npc, state, rng, t => (t.crimes.length > 0 || t.coin > 30) && t.age >= 14);
       if (!target) return null;
       if (success) {
         const amount = seededInt(rng, 5, 20);
@@ -1090,7 +1078,7 @@ function buildActions(): ActionDef[] {
       const rel = npc.relationships.find(r => r.trust > 0.2);
       if (!rel) return null;
       const target = state.npcs.get(rel.targetId);
-      if (!target || !target.alive) return null;
+      if (!target || !target.alive || target.age < 14) return null;
       reinforceRelationship(npc, target.id, -0.7, -0.8, state.tick);
       reinforceRelationship(target, npc.id, -0.8, -0.9, state.tick);
       addMemory(target, { eventId: `betrayed_${npc.id}`, valence: -0.95, salience: 0.95, confidence: 1, source: 'witnessed', tick: state.tick });
@@ -1106,30 +1094,54 @@ function buildActions(): ActionDef[] {
     }
   });
 
-  // MURDER
+  // MURDER - Only with active revenge goal or criminal faction debt/extortion
   actions.push({
     id: 'murder',
-    preconditions: (npc) => npc.alive && npc.traits.courage > 0.4 && (1 - npc.traits.honesty) > 0.4,
-    utility: (npc, p) => p.vengeance * 0.5 + npc.traits.cunning * 0.2 + npc.traits.temper * 0.3,
-    successChance: (npc) => clamp(0.2 + npc.skills.fighting * 0.003 + npc.skills.stealth * 0.003, 0.05, 0.7),
+    preconditions: (npc) => {
+      if (!npc.alive) return false;
+      // Must have active revenge goal OR be criminal faction with debt/extortion motive
+      const hasRevengeGoal = npc.goals.some(g => g.type === 'revenge' && g.progress < 1);
+      const isCriminalWithMotive = npc.faction === 'Criminal Underground' && 
+        (npc.debts.length > 0 || npc.memories.some(m => m.eventId.includes('extort') || m.eventId.includes('debt')));
+      return hasRevengeGoal || isCriminalWithMotive;
+    },
+    utility: (npc, p) => {
+      // Only high utility if has revenge goal
+      const hasRevengeGoal = npc.goals.some(g => g.type === 'revenge');
+      if (hasRevengeGoal) return p.vengeance * 0.8 + npc.traits.cunning * 0.2;
+      return 0.1; // Very low for criminal faction acts
+    },
+    successChance: (npc) => clamp(0.15 + npc.skills.fighting * 0.002 + npc.skills.stealth * 0.002, 0.05, 0.5),
     execute: (npc, state, success, rng) => {
-      // Target someone they have grievance with
-      const grievance = npc.memories.filter(m => m.valence < -0.6);
+      // Target from revenge goal
+      const revengeGoal = npc.goals.find(g => g.type === 'revenge' && g.targetId !== undefined);
       let target: NPC | null = null;
-      if (grievance.length > 0) {
-        const mem = seededChoice(rng, grievance);
-        // Try to find the npc from the memory event
-        const possibleTargets = Array.from(state.npcs.values()).filter(n => n.alive && n.id !== npc.id);
-        if (possibleTargets.length > 0) target = seededChoice(rng, possibleTargets);
-      } else {
-        target = findNearbyNPC(npc, state, rng);
+      
+      if (revengeGoal && revengeGoal.targetId !== undefined) {
+        target = state.npcs.get(revengeGoal.targetId) || null;
+      } else if (npc.faction === 'Criminal Underground') {
+        // Criminal faction: target someone with debt to them
+        const debtors = Array.from(state.npcs.values()).filter(n => 
+          n.alive && n.age >= 14 && n.debts.some(d => d.creditorId === npc.id)
+        );
+        if (debtors.length > 0) target = seededChoice(rng, debtors);
       }
-      if (!target) return null;
+      
+      // Child protection
+      if (!target || target.age < 14) return null;
+      
       if (success) {
         target.alive = false;
         target.health = 0;
         logDeath(target, state, 'murder');
         addMemory(npc, { eventId: `murdered_${target.id}`, valence: npc.traits.empathy > 0.5 ? -0.5 : 0.3, salience: 0.95, confidence: 1, source: 'witnessed', tick: state.tick });
+        
+        // Mark revenge goal as completed
+        if (revengeGoal) {
+          revengeGoal.progress = 1;
+          state.revengeAttacksCompleted++;
+        }
+        
         // Investigation chance
         if (rng() < 0.4) {
           npc.crimes.push({ type: 'murder', tick: state.tick, victimId: target.id, solved: true });
@@ -1143,7 +1155,7 @@ function buildActions(): ActionDef[] {
       adjustReputation(npc, 'Guards', -0.5);
       const trace = makeTrace(npc, 'murder', [], computePressures(npc, state), rng, success);
       const text = fillTemplate(getTemplate('murder', rng), { npc: npc.name, target: target.name });
-      return createLogEntry(state, 'murder', text, [npc.id, target.id], trace, 0.9, ['crime', 'death', 'violence']);
+      return createLogEntry(state, 'murder', text, [npc.id, target.id], trace, 0.9, ['crime', 'death', 'violence', 'revenge']);
     }
   });
 
@@ -1154,7 +1166,7 @@ function buildActions(): ActionDef[] {
     utility: (npc, p) => p.vengeance * 0.4 + npc.traits.cunning * 0.4 + (1 - npc.traits.honesty) * 0.2,
     successChance: (npc) => clamp(0.15 + npc.skills.stealth * 0.004 + npc.traits.cunning * 0.2, 0.05, 0.6),
     execute: (npc, state, success, rng) => {
-      const target = findTarget(npc, state, rng);
+      const target = findTarget(npc, state, rng, t => t.age >= 14);
       if (!target) return null;
       if (success) {
         target.health -= seededRandom(rng, 0.2, 0.5);
@@ -1186,7 +1198,7 @@ function buildActions(): ActionDef[] {
     }
   });
 
-  // PRAY
+  // PRAY - routine, never logged
   actions.push({
     id: 'pray',
     preconditions: (npc) => npc.alive && npc.traits.piety > 0.3,
@@ -1195,9 +1207,7 @@ function buildActions(): ActionDef[] {
     execute: (npc, state, success, rng) => {
       npc.safety = Math.max(0, npc.safety - 0.1);
       npc.belonging = Math.max(0, npc.belonging - 0.05);
-      const trace = makeTrace(npc, 'pray', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('pray', rng), { npc: npc.name });
-      return createLogEntry(state, 'pray', text, [npc.id], trace, 0.1);
+      return null; // Never log routine prayer
     }
   });
 
@@ -1299,7 +1309,7 @@ function buildActions(): ActionDef[] {
     utility: (npc, p) => npc.traits.loyalty * 0.4 + p.factionLoyalty * 0.4 + npc.traits.courage * 0.2,
     successChance: (npc) => 0.6 + npc.skills.fighting * 0.003,
     execute: (npc, state, success, rng) => {
-      const criminals = Array.from(state.npcs.values()).filter(n => n.alive && n.crimes.some(c => c.solved));
+      const criminals = Array.from(state.npcs.values()).filter(n => n.alive && n.age >= 14 && n.crimes.some(c => c.solved));
       if (criminals.length === 0) return null;
       const target = seededChoice(rng, criminals);
       if (success) {
@@ -1323,7 +1333,7 @@ function buildActions(): ActionDef[] {
     execute: (npc, state, success, rng) => {
       const grievance = npc.memories.filter(m => m.valence < -0.5);
       if (grievance.length === 0) return null;
-      const targets = Array.from(state.npcs.values()).filter(n => n.alive && n.id !== npc.id);
+      const targets = Array.from(state.npcs.values()).filter(n => n.alive && n.id !== npc.id && n.age >= 14);
       if (targets.length === 0) return null;
       const target = seededChoice(rng, targets);
       if (success) {
@@ -1775,6 +1785,25 @@ function processWorldEvents(state: SimulationState): void {
       }
     }
     
+    // Fallback text if description is empty
+    if (!description || description.trim() === '') {
+      const fallbacks: Record<string, string> = {
+        'harvest_failure': 'The harvest failed this season, leaving farmers with empty stores.',
+        'plague': 'A mysterious illness has spread through the settlement.',
+        'bandit_raid': 'Bandits struck the settlement, taking what they could.',
+        'fire': 'A fire broke out, causing damage and fear.',
+        'festival': 'The settlement held a festival to lift spirits.',
+        'trade_caravan': 'A trade caravan arrived with goods from distant lands.',
+        'immigrants': 'New settlers have arrived, seeking a home.',
+        'tax_hike': 'The leadership has raised taxes to fund public works.',
+        'flood': 'Floodwaters have risen, damaging homes and fields.',
+        'famine': 'Food grows scarce as famine grips the settlement.',
+        'foreign_war': 'War has been declared, and the settlement must prepare.',
+        'rare_festival': 'A once-in-a-generation festival brings wonder to all.',
+      };
+      description = fallbacks[evt.kind] || `A ${evt.kind} event has occurred.`;
+    }
+    
     const worldEvent: WorldEvent = {
       id: eventId, tick: state.tick, kind: evt.kind, actors: actors.slice(0, 20),
       causes: [], effects: [], description,
@@ -1980,9 +2009,11 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
   }
   
   // Birth (if married and conditions met) - increased rate for sustainability
-  if (npc.spouseId && npc.age > 20 && npc.age < 42 && npc.sex === 'F' && state.rng() < 0.005) {
+  // Requirements: married, fertile age (18-40), health > 0.5, not starving (hunger < 0.7)
+  if (npc.spouseId && npc.age >= 18 && npc.age <= 40 && npc.sex === 'F' && 
+      npc.health > 0.5 && npc.hunger < 0.7 && state.rng() < 0.008) {
     const spouse = state.npcs.get(npc.spouseId);
-    if (spouse && spouse.alive) {
+    if (spouse && spouse.alive && spouse.health > 0.4) {
       const child = createNPC(state.rng, state.nextNpcId++, 0);
       child.district = npc.district;
       child.health = 0.9; // Healthy birth

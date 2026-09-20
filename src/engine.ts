@@ -2756,6 +2756,57 @@ export function exportStories(stories: TopStory[]): string {
   })), null, 2);
 }
 
+export function exportFullSimulation(state: SimulationState): string {
+  const npcs = Array.from(state.npcs.values()).map(npc => ({
+    id: npc.id,
+    name: npc.name,
+    age: npc.age,
+    sex: npc.sex,
+    alive: npc.alive,
+    district: npc.district,
+    job: npc.job,
+    coin: npc.coin,
+    health: npc.health,
+    hunger: npc.hunger,
+    traits: npc.traits,
+    skills: npc.skills,
+    faction: npc.faction,
+    reputation: npc.reputation,
+    spouseId: npc.spouseId,
+    parentIds: npc.parentIds,
+    familyLinks: npc.familyLinks,
+    crimes: npc.crimes,
+    debts: npc.debts,
+    goals: npc.goals,
+    memories: npc.memories.slice(0, 10), // Limit to avoid huge exports
+  }));
+
+  return JSON.stringify({
+    metadata: {
+      seed: state.seed,
+      tick: state.tick,
+      year: Math.floor(state.tick / 360) + 1,
+      totalNPCs: state.npcs.size,
+      aliveNPCs: Array.from(state.npcs.values()).filter(n => n.alive).length,
+      totalEvents: state.log.length,
+      totalBirths: state.totalBirths,
+      totalDeaths: state.totalDeaths,
+      emigrated: state.emigrated,
+    },
+    stats: state.stats,
+    economy: {
+      prices: state.economy.prices,
+      supply: state.economy.supply,
+      demand: state.economy.demand,
+    },
+    factionPower: state.factionPower,
+    npcs: npcs,
+    worldEvents: state.worldEvents,
+    storyHooks: state.storyHooks,
+    log: state.log.slice(-1000), // Last 1000 events to avoid huge exports
+  }, null, 2);
+}
+
 // ============================================================
 // SECTION 21: SELF-TEST
 // ============================================================

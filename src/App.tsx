@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { 
   coverageReport, deriveCapabilities, 
-  initSimulation, generateTopStories, healthCheck, runSelfTest, exportLog, exportStories,
+  initSimulation, generateTopStories, healthCheck, runSelfTest, exportLog, exportStories, exportFullSimulation,
   runSimulation, stepSimulation,
   type SimulationState, type LogEntry, type TopStory, type HealthFlag, type SelfTestResult
 } from './engine';
@@ -155,10 +155,59 @@ function App() {
               <>
                 <button
                   onClick={() => {
-                    const blob = new Blob([exportLog(state)], { type: 'application/json' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url; a.download = 'simulation_log.json'; a.click();
+                    let data = '';
+                    try {
+                      console.log('Export Log clicked, state:', state);
+                      if (!state) {
+                        alert('No simulation state available. Please run a simulation first.');
+                        return;
+                      }
+                      data = exportLog(state);
+                      console.log('Export data length:', data.length);
+                      if (!data || data.length === 0) {
+                        alert('No data to export. The log might be empty.');
+                        return;
+                      }
+                      
+                      // Try download method first
+                      const blob = new Blob([data], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'simulation_log.json';
+                      a.style.display = 'none';
+                      document.body.appendChild(a);
+                      
+                      // Force click
+                      const event = new MouseEvent('click', {
+                        view: window,
+                        bubbles: true,
+                        cancelable: false
+                      });
+                      a.dispatchEvent(event);
+                      
+                      // Cleanup
+                      setTimeout(() => {
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }, 100);
+                      
+                      console.log('Export completed successfully');
+                    } catch (error) {
+                      console.error('Export failed:', error);
+                      // Fallback: open in new window
+                      try {
+                        const newWindow = window.open('', '_blank');
+                        if (newWindow && data) {
+                          newWindow.document.write('<pre>' + data + '</pre>');
+                          newWindow.document.title = 'Simulation Log';
+                        } else {
+                          alert('Export failed and could not open fallback window. Please check browser popup settings.');
+                        }
+                      } catch (fallbackError) {
+                        alert('Export failed completely: ' + (error as Error).message);
+                      }
+                    }
                   }}
                   className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded text-sm"
                 >
@@ -166,14 +215,115 @@ function App() {
                 </button>
                 <button
                   onClick={() => {
-                    const blob = new Blob([exportStories(topStories)], { type: 'application/json' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url; a.download = 'top_stories.json'; a.click();
+                    let data = '';
+                    try {
+                      console.log('Export Stories clicked, topStories:', topStories);
+                      if (!topStories || topStories.length === 0) {
+                        alert('No stories to export. The stories list is empty.');
+                        return;
+                      }
+                      data = exportStories(topStories);
+                      console.log('Export data length:', data.length);
+                      if (!data || data.length === 0) {
+                        alert('No data to export.');
+                        return;
+                      }
+                      
+                      const blob = new Blob([data], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'top_stories.json';
+                      a.style.display = 'none';
+                      document.body.appendChild(a);
+                      
+                      const event = new MouseEvent('click', {
+                        view: window,
+                        bubbles: true,
+                        cancelable: false
+                      });
+                      a.dispatchEvent(event);
+                      
+                      setTimeout(() => {
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }, 100);
+                      
+                      console.log('Export completed successfully');
+                    } catch (error) {
+                      console.error('Export failed:', error);
+                      try {
+                        const newWindow = window.open('', '_blank');
+                        if (newWindow && data) {
+                          newWindow.document.write('<pre>' + data + '</pre>');
+                          newWindow.document.title = 'Top Stories';
+                        } else {
+                          alert('Export failed and could not open fallback window.');
+                        }
+                      } catch (fallbackError) {
+                        alert('Export failed completely: ' + (error as Error).message);
+                      }
+                    }
                   }}
                   className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded text-sm"
                 >
                   Export Stories
+                </button>
+                <button
+                  onClick={() => {
+                    let data = '';
+                    try {
+                      console.log('Full Export clicked, state:', state);
+                      if (!state) {
+                        alert('No simulation state available. Please run a simulation first.');
+                        return;
+                      }
+                      data = exportFullSimulation(state);
+                      console.log('Full export data length:', data.length);
+                      if (!data || data.length === 0) {
+                        alert('No data to export.');
+                        return;
+                      }
+                      
+                      const blob = new Blob([data], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `simulation_seed${state.seed}_year${Math.floor(state.tick / 360) + 1}.json`;
+                      a.style.display = 'none';
+                      document.body.appendChild(a);
+                      
+                      const event = new MouseEvent('click', {
+                        view: window,
+                        bubbles: true,
+                        cancelable: false
+                      });
+                      a.dispatchEvent(event);
+                      
+                      setTimeout(() => {
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }, 100);
+                      
+                      console.log('Full export completed successfully');
+                    } catch (error) {
+                      console.error('Full export failed:', error);
+                      try {
+                        const newWindow = window.open('', '_blank');
+                        if (newWindow && data) {
+                          newWindow.document.write('<pre>' + data + '</pre>');
+                          newWindow.document.title = 'Full Simulation Export';
+                        } else {
+                          alert('Full export failed and could not open fallback window.');
+                        }
+                      } catch (fallbackError) {
+                        alert('Full export failed completely: ' + (error as Error).message);
+                      }
+                    }
+                  }}
+                  className="bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded text-sm"
+                >
+                  Full Export
                 </button>
               </>
             )}

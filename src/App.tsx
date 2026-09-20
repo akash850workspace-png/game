@@ -2,11 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import {
   runSimulation, stepSimulation, initSimulation, generateTopStories,
   healthCheck, exportLog, exportStories, coverageReport, deriveCapabilities,
-  type SimulationState, type LogEntry, type TopStory, type HealthFlag
+  runSelfTest, type SimulationState, type LogEntry, type TopStory, type HealthFlag, type SelfTestResult
 } from './engine';
 import { ELEMENTS } from './data';
 
-type Tab = 'log' | 'stories' | 'stats' | 'health' | 'trace' | 'coverage';
+type Tab = 'log' | 'stories' | 'stats' | 'health' | 'trace' | 'coverage' | 'selftest';
 
 function App() {
   const [seed, setSeed] = useState(42);
@@ -21,6 +21,8 @@ function App() {
   const [topStories, setTopStories] = useState<TopStory[]>([]);
   const [healthFlags, setHealthFlags] = useState<HealthFlag[]>([]);
   const [speed, setSpeed] = useState(100);
+  const [selfTestResults, setSelfTestResults] = useState<SelfTestResult[] | null>(null);
+  const [selfTestRunning, setSelfTestRunning] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const handleRun = useCallback(() => {
@@ -79,6 +81,22 @@ function App() {
     }, 50);
   }, [seed]);
 
+  const handleSelfTest = useCallback(() => {
+    setSelfTestRunning(true);
+    setSelfTestResults(null);
+    
+    setTimeout(() => {
+      try {
+        const seeds = [1, 2, 3, 7741, 99999];
+        const results = seeds.map(s => runSelfTest(s));
+        setSelfTestResults(results);
+      } catch (e) {
+        console.error('Self-test error:', e);
+      }
+      setSelfTestRunning(false);
+    }, 50);
+  }, []);
+
   const filteredLog = state?.log.filter(entry => {
     if (filterYear && entry.year !== filterYear) return false;
     if (filterType && entry.type !== filterType) return false;
@@ -120,10 +138,17 @@ function App() {
             />
             <button
               onClick={handleFastRun}
-              disabled={running}
+              disabled={running || selfTestRunning}
               className="bg-amber-600 hover:bg-amber-500 disabled:bg-gray-600 text-white px-4 py-1.5 rounded text-sm font-medium transition-colors"
             >
               {running ? `Running... ${progress}%` : 'Run 100 Years'}
+            </button>
+            <button
+              onClick={handleSelfTest}
+              disabled={running || selfTestRunning}
+              className="bg-green-600 hover:bg-green-500 disabled:bg-gray-600 text-white px-4 py-1.5 rounded text-sm font-medium transition-colors"
+            >
+              {selfTestRunning ? 'Testing...' : 'Run Self-Test'}
             </button>
             {state && (
               <>
@@ -180,8 +205,8 @@ function App() {
       {/* Main content */}
       <div className="flex-1 flex flex-col max-w-7xl mx-auto w-full">
         {/* Tabs */}
-        <div className="flex border-b border-gray-700">
-          {(['log', 'stories', 'stats', 'health', 'trace', 'coverage'] as Tab[]).map(t => (
+        <div className="flex border-b border-gray-700 flex-wrap">
+          {(['log', 'stories', 'stats', 'health', 'trace', 'coverage', 'selftest'] as Tab[]).map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -189,7 +214,7 @@ function App() {
                 tab === t ? 'text-amber-400 border-b-2 border-amber-400' : 'text-gray-400 hover:text-gray-200'
               }`}
             >
-              {t === 'log' ? '📜 Event Log' : t === 'stories' ? '📖 Top Stories' : t === 'stats' ? '📊 Statistics' : t === 'health' ? '🏥 Health Check' : t === 'trace' ? '🔍 Causal Trace' : '📋 Coverage'}
+              {t === 'log' ? '📜 Event Log' : t === 'stories' ? '📖 Top Stories' : t === 'stats' ? '📊 Statistics' : t === 'health' ? '🏥 Health Check' : t === 'trace' ? '🔍 Causal Trace' : t === 'coverage' ? '📋 Coverage' : '🧪 Self-Test'}
             </button>
           ))}
         </div>
@@ -541,6 +566,86 @@ function App() {
                   })()}
                 </div>
               </div>
+            </div>
+          )}
+
+          {tab === 'selftest' && (
+            <div className="space-y-4">
+              <h2 className="text-lg font-bold text-amber-400">Self-Test Results</h2>
+              <p className="text-gray-400 text-sm">Running 100-year simulation for seeds 1, 2, 3, 7741, 99999...</p>
+              
+              {selfTestRunning && (
+                <div className="bg-gray-800 rounded border border-gray-700 p-4 text-center">
+                  <p className="text-amber-400">Running self-test... please wait.</p>
+                </div>
+              )}
+              
+              {selfTestResults && (
+                <div className="space-y-6">
+                  {/* Results table */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs font-mono">
+                      <thead>
+                        <tr className="text-gray-400 border-b border-gray-700">
+                          <th className="p-2 text-left">seed</th>
+                          <th className="p-2 text-right">final pop</th>
+                          <th className="p-2 text-right">min pop</th>
+                          <th className="p-2 text-right">max pop</th>
+                          <th className="p-2 text-right">births</th>
+                          <th className="p-2 text-right">deaths</th>
+                          <th className="p-2 text-right">emigrated</th>
+                          <th className="p-2 text-right">avg coin</th>
+                          <th className="p-2 text-right">crimes/yr</th>
+                          <th className="p-2 text-right">rev.goals</th>
+                          <th className="p-2 text-right">rev.attacks</th>
+                          <th className="p-2 text-right">storylines</th>
+                          <th className="p-2 text-right">max len(yr)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {selfTestResults.map(r => (
+                          <tr key={r.seed} className="border-b border-gray-800">
+                            <td className="p-2 text-amber-400">{r.seed}</td>
+                            <td className="p-2 text-right">{r.finalPop}</td>
+                            <td className="p-2 text-right">{r.minPop}</td>
+                            <td className="p-2 text-right">{r.maxPop}</td>
+                            <td className="p-2 text-right">{r.totalBirths}</td>
+                            <td className="p-2 text-right">{r.totalDeaths}</td>
+                            <td className="p-2 text-right">{r.emigrated}</td>
+                            <td className="p-2 text-right">{r.avgCoin.toFixed(1)}</td>
+                            <td className="p-2 text-right">{r.crimesPerYear.toFixed(1)}</td>
+                            <td className="p-2 text-right">{r.revengeGoalsCreated}</td>
+                            <td className="p-2 text-right">{r.revengeAttacksCompleted}</td>
+                            <td className="p-2 text-right">{r.distinctStorylines}</td>
+                            <td className="p-2 text-right">{r.maxStorylineLengthYears}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  
+                  {/* Pass/Fail checks */}
+                  <div className="space-y-3">
+                    {selfTestResults.map(r => (
+                      <div key={r.seed} className="bg-gray-800 rounded border border-gray-700 p-3">
+                        <h3 className="text-amber-400 font-medium mb-2">Seed {r.seed}</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-1">
+                          {r.checks.map((check, i) => (
+                            <div key={i} className={`text-xs p-1 rounded ${check.passed ? 'text-green-400' : 'text-red-400'}`}>
+                              {check.passed ? '✅' : '❌'} {check.name}: {check.detail}
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-2 text-xs">
+                          <span className={r.checks.every(c => c.passed) ? 'text-green-400 font-bold' : 'text-red-400 font-bold'}>
+                            {r.checks.every(c => c.passed) ? '✅ ALL PASS' : `❌ ${r.checks.filter(c => !c.passed).length} FAILED`}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

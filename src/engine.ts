@@ -204,11 +204,22 @@ export interface SimulationState {
     giniByYear: number[];
     crimeRateByYear: number[];
     foodPriceByYear: number[];
+    minPopByYear: number[];
+    maxPopByYear: number[];
+    birthsByYear: number[];
+    deathsByYear: number[];
   };
   factionPower: Record<Faction, number>;
   settlementCoin: number; // communal funds
   laws: { crime: string; severity: number }[];
   nextEventId: number;
+  emigrated: number;
+  totalBirths: number;
+  totalDeaths: number;
+  revengeGoalsCreated: number;
+  revengeAttacksCompleted: number;
+  actionCounts: Record<string, number>;
+  deathTicks: Map<number, number>; // npcId -> tick of death
 }
 
 // ============================================================
@@ -218,7 +229,10 @@ export interface SimulationState {
 function generateName(rng: () => number): string {
   const first = seededChoice(rng, FIRST_SYLLABLES);
   const last = seededChoice(rng, LAST_SYLLABLES);
-  return `${first} ${last}`;
+  // Capitalize first letter of each part
+  const capFirst = first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+  const capLast = last.charAt(0).toUpperCase() + last.slice(1).toLowerCase();
+  return `${capFirst} ${capLast}`;
 }
 
 function generateTraits(rng: () => number): NPC['traits'] {
@@ -356,7 +370,12 @@ export function initSimulation(seed: number): SimulationState {
     economy: initEconomy(rng),
     wildlife: { creatures, lastEventTick: 0 },
     log: [], worldEvents: [], storyHooks: [],
-    stats: { populationByYear: [], avgCoinByYear: [], giniByYear: [], crimeRateByYear: [], foodPriceByYear: [] },
+    stats: { 
+      populationByYear: [], avgCoinByYear: [], giniByYear: [], 
+      crimeRateByYear: [], foodPriceByYear: [],
+      minPopByYear: [], maxPopByYear: [],
+      birthsByYear: [], deathsByYear: []
+    },
     factionPower: { Guards: 0.3, 'Merchant Guild': 0.25, 'Farmer Collective': 0.25, 'Criminal Underground': 0.2 },
     settlementCoin: 500,
     laws: [
@@ -367,6 +386,13 @@ export function initSimulation(seed: number): SimulationState {
       { crime: 'embezzlement', severity: 0.6 },
     ],
     nextEventId: 0,
+    emigrated: 0,
+    totalBirths: 0,
+    totalDeaths: 0,
+    revengeGoalsCreated: 0,
+    revengeAttacksCompleted: 0,
+    actionCounts: {},
+    deathTicks: new Map(),
   };
 }
 
@@ -590,32 +616,64 @@ function buildActions(): ActionDef[] {
       npc.coin += earnings;
       npc.hunger += 0.1;
       npc.rest += 0.15;
+      
+      // Farmers and fishers produce food
+      if ((npc.job === 'farmer' || npc.job === 'fisher') && success) {
+        const foodProduced = seededInt(rng, 2, 5);
+        npc.inventory.food = (npc.inventory.food || 0) + foodProduced;
+        state.economy.supply.food += foodProduced;
+      }
+      
       const trace = makeTrace(npc, 'work', [], computePressures(npc, state), rng, success);
       const text = fillTemplate(getTemplate('work', rng), { npc: npc.name, job: npc.job, district: npc.district });
-      return createLogEntry(state, 'work', text, [npc.id], trace, 0.1);
+      // Only log work occasionally (not every time)
+      if (rng() < 0.1) {
+        return createLogEntry(state, 'work', text, [npc.id], trace, 0.1);
+      }
+      return null;
     }
   });
 
-  // EAT
+  // EAT - Survival override: if very hungry, this MUST be chosen
   actions.push({
     id: 'eat',
     preconditions: (npc) => npc.alive && npc.hunger > 0.3,
-    utility: (npc, p) => p.hunger * 0.8 + p.health * 0.2,
-    successChance: () => 0.9,
+    utility: (npc, p) => {
+      // Survival override: if hunger >= 0.6, make eat extremely high priority
+      const baseUtility = p.hunger * 0.8 + p.health * 0.2;
+      if (npc.hunger >= 0.6) return baseUtility + 5.0; // Force eat
+      return baseUtility;
+    },
+    successChance: () => 0.95,
     execute: (npc, state, success, rng) => {
-      if (npc.coin >= 2 || npc.inventory.food > 0) {
-        if (npc.inventory.food > 0) npc.inventory.food--;
-        else npc.coin -= 2;
+      let ate = false;
+      if (npc.inventory.food > 0) {
+        npc.inventory.food--;
+        ate = true;
+      } else if (npc.coin >= 2) {
+        npc.coin -= 2;
+        ate = true;
+      } else if (rng() < 0.6) {
+        // Subsistence foraging/charity - 60% chance
+        ate = true;
+      }
+      
+      const wasStarving = npc.hunger > 0.7;
+      if (ate) {
         npc.hunger = Math.max(0, npc.hunger - 0.5);
         npc.health = Math.min(1, npc.health + 0.02);
       }
       const trace = makeTrace(npc, 'eat', [], computePressures(npc, state), rng, success);
       const text = fillTemplate(getTemplate('eat', rng), { npc: npc.name });
-      return createLogEntry(state, 'eat', text, [npc.id], trace, 0.05);
+      // Only log eating if it was significant (was starving)
+      if (wasStarving && ate) {
+        return createLogEntry(state, 'eat', text, [npc.id], trace, 0.15, ['survival']);
+      }
+      return null; // Routine eating not logged
     }
   });
 
-  // SLEEP
+  // SLEEP - routine, rarely logged
   actions.push({
     id: 'sleep',
     preconditions: (npc) => npc.alive && npc.rest > 0.4,
@@ -624,9 +682,8 @@ function buildActions(): ActionDef[] {
     execute: (npc, state, success, rng) => {
       npc.rest = Math.max(0, npc.rest - 0.6);
       npc.health = Math.min(1, npc.health + 0.03);
-      const trace = makeTrace(npc, 'sleep', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('sleep', rng), { npc: npc.name });
-      return createLogEntry(state, 'sleep', text, [npc.id], trace, 0.02);
+      // Don't log sleep - it's routine
+      return null;
     }
   });
 
@@ -1071,6 +1128,7 @@ function buildActions(): ActionDef[] {
       if (success) {
         target.alive = false;
         target.health = 0;
+        logDeath(target, state, 'murder');
         addMemory(npc, { eventId: `murdered_${target.id}`, valence: npc.traits.empathy > 0.5 ? -0.5 : 0.3, salience: 0.95, confidence: 1, source: 'witnessed', tick: state.tick });
         // Investigation chance
         if (rng() < 0.4) {
@@ -1259,7 +1317,7 @@ function buildActions(): ActionDef[] {
   // SEEK_REVENGE
   actions.push({
     id: 'seek_revenge',
-    preconditions: (npc) => npc.alive && npc.traits.temper > 0.4,
+    preconditions: (npc) => npc.alive && npc.traits.temper > 0.4 && npc.memories.some(m => m.valence < -0.5),
     utility: (npc, p) => p.vengeance * 0.6 + npc.traits.temper * 0.3 + npc.traits.courage * 0.1,
     successChance: (npc) => clamp(0.2 + npc.skills.fighting * 0.003 + npc.traits.cunning * 0.2, 0.05, 0.7),
     execute: (npc, state, success, rng) => {
@@ -1273,11 +1331,12 @@ function buildActions(): ActionDef[] {
         target.coin = Math.max(0, target.coin - seededInt(rng, 3, 10));
         npc.safety = Math.max(0, npc.safety - 0.1);
         addMemory(target, { eventId: `revenged_${npc.id}`, valence: -0.8, salience: 0.85, confidence: 1, source: 'witnessed', tick: state.tick });
+        state.revengeAttacksCompleted++;
       }
       npc.crimes.push({ type: 'assault', tick: state.tick, victimId: target.id, solved: rng() < 0.3 });
       const trace = makeTrace(npc, 'seek_revenge', [], computePressures(npc, state), rng, success);
       const text = fillTemplate(getTemplate('seek_revenge', rng), { npc: npc.name, target: target.name });
-      return createLogEntry(state, 'seek_revenge', text, [npc.id, target.id], trace, 0.6, ['violence', 'drama']);
+      return createLogEntry(state, 'seek_revenge', text, [npc.id, target.id], trace, 0.6, ['violence', 'drama', 'revenge']);
     }
   });
 
@@ -1387,16 +1446,19 @@ function buildActions(): ActionDef[] {
     }
   });
 
-  // FLEE
+  // FLEE - just change district, rare
   actions.push({
     id: 'flee',
-    preconditions: (npc) => npc.alive && (npc.safety > 0.5 || npc.crimes.length > 2),
-    utility: (npc, p) => p.fear * 0.5 + (1 - npc.traits.courage) * 0.3 + npc.traits.cunning * 0.2,
+    preconditions: (npc) => npc.alive && (npc.safety > 0.6 || npc.crimes.length > 3),
+    utility: (npc, p) => (p.fear * 0.3 + (1 - npc.traits.courage) * 0.2 + npc.traits.cunning * 0.1) * 0.3, // Very low utility
     successChance: (npc) => 0.7 + npc.skills.stealth * 0.002,
     execute: (npc, state, success, rng) => {
       if (success) {
-        const newDistrict = seededChoice(rng, DISTRICTS.filter(d => d !== npc.district));
-        npc.district = newDistrict;
+        const otherDistricts = DISTRICTS.filter(d => d !== npc.district);
+        if (otherDistricts.length > 0) {
+          const newDistrict = seededChoice(rng, [...otherDistricts]);
+          npc.district = newDistrict;
+        }
         npc.crimes = []; // Reset crimes when fleeing
         npc.safety = Math.max(0, npc.safety - 0.3);
       }
@@ -1503,19 +1565,20 @@ function buildActions(): ActionDef[] {
     }
   });
 
-  // EMIGRATE (leave settlement)
+  // EMIGRATE (leave settlement) - VERY RARE, only under sustained hardship
   actions.push({
     id: 'migrate',
-    preconditions: (npc) => npc.alive,
-    utility: (npc, p) => npc.traits.curiosity * 0.3 + p.fear * 0.3 + p.poverty * 0.2 + (1 - npc.traits.loyalty) * 0.2,
-    successChance: () => 0.7,
+    preconditions: (npc) => npc.alive && npc.hunger > 0.7 && npc.safety > 0.5 && npc.age > 20 && npc.age < 50,
+    utility: (npc, p) => (npc.traits.curiosity * 0.2 + p.fear * 0.2 + p.poverty * 0.1 + (1 - npc.traits.loyalty) * 0.1) * 0.15, // Extremely low
+    successChance: () => 0.5,
     execute: (npc, state, success, rng) => {
       if (!success) return null;
-      const newDistrict = seededChoice(rng, DISTRICTS.filter(d => d !== npc.district));
-      npc.district = newDistrict;
+      // Emigrate - remove from population
+      npc.alive = false;
+      state.emigrated = (state.emigrated || 0) + 1;
       const trace = makeTrace(npc, 'migrate', [], computePressures(npc, state), rng, success);
-      const text = fillTemplate(getTemplate('migrate', rng), { npc: npc.name, district: newDistrict });
-      return createLogEntry(state, 'migrate', text, [npc.id], trace, 0.2);
+      const text = fillTemplate(getTemplate('migrate', rng), { npc: npc.name, district: npc.district });
+      return createLogEntry(state, 'migrate', text, [npc.id], trace, 0.4, ['emigration']);
     }
   });
 
@@ -1529,24 +1592,31 @@ function buildActions(): ActionDef[] {
 function updateEconomy(state: SimulationState): void {
   const { economy } = state;
   const season = Math.floor((state.tick % 360) / 90);
+  const aliveCount = Array.from(state.npcs.values()).filter(n => n.alive).length;
   
   for (const resource of Object.keys(economy.prices)) {
-    // Supply/demand adjustment
+    // Damped price movement toward target derived from supply/demand ratio
     const ratio = economy.demand[resource] / Math.max(1, economy.supply[resource]);
-    const priceChange = (ratio - 1) * 0.05;
-    economy.prices[resource] = clamp(economy.prices[resource] + priceChange, 0.2, 5.0);
+    // Target price: 1.0 at equilibrium, higher when demand > supply
+    const targetPrice = clamp(0.5 + ratio * 0.8, 0.3, 4.0);
+    // Damped movement: move 10% toward target each update
+    const damping = 0.1;
+    economy.prices[resource] = economy.prices[resource] + (targetPrice - economy.prices[resource]) * damping;
+    economy.prices[resource] = clamp(economy.prices[resource], 0.2, 5.0);
     
-    // Seasonal effects
+    // Seasonal effects for food
     if (resource === 'food' || resource === 'grain') {
-      if (season === 2 || season === 3) { // Autumn/Winter - less supply
-        economy.supply[resource] = Math.max(10, economy.supply[resource] - 1);
-      } else { // Spring/Summer - more supply
-        economy.supply[resource] += 2;
+      // Base food demand from population
+      economy.demand[resource] = Math.max(10, aliveCount * 0.8);
+      if (season === 2 || season === 3) { // Autumn/Winter - consumption continues
+        economy.supply[resource] = Math.max(5, economy.supply[resource] - Math.floor(aliveCount * 0.05));
+      } else { // Spring/Summer - natural growth
+        economy.supply[resource] += Math.floor(aliveCount * 0.03);
       }
+    } else {
+      // Other resources: decay demand slightly, keep supply stable
+      economy.demand[resource] = Math.max(10, economy.demand[resource] * 0.98);
     }
-    
-    // Decay demand slightly
-    economy.demand[resource] = Math.max(10, economy.demand[resource] - 0.5);
     
     // Record history
     economy.priceHistory[resource].push(economy.prices[resource]);
@@ -1739,51 +1809,102 @@ function processWorldEvents(state: SimulationState): void {
 function processWildlife(state: SimulationState): void {
   const { rng, wildlife } = state;
   
-  // Creatures threaten farms periodically
-  if (state.tick - wildlife.lastEventTick > 90) {
+  // Creatures threaten farms every 1-2 years (360-720 ticks)
+  const interval = 360 + Math.floor(rng() * 360);
+  if (state.tick - wildlife.lastEventTick > interval) {
     wildlife.lastEventTick = state.tick;
     const activeCreatures = wildlife.creatures.filter(c => c.alive);
     if (activeCreatures.length === 0) return;
     
     const creature = seededChoice(rng, activeCreatures);
-    if (creature.threat > 0.3 && rng() < creature.threat * 0.3) {
-      // Threaten farms
-      const farmers = Array.from(state.npcs.values()).filter(n => n.alive && (n.job === 'farmer' || n.district === 'Farms'));
-      if (farmers.length > 0) {
-        const victim = seededChoice(rng, farmers);
-        victim.inventory.food = Math.max(0, (victim.inventory.food || 0) - seededInt(rng, 2, 8));
-        state.economy.supply.food -= seededInt(rng, 2, 5);
-        
-        state.log.push({
-          id: `WL${state.nextEventId++}`, tick: state.tick,
-          year: Math.floor(state.tick / 360) + 1, day: (state.tick % 360) + 1,
-          season: ['Spring', 'Summer', 'Autumn', 'Winter'][Math.floor((state.tick % 360) / 90)],
-          type: 'wildlife', text: `A ${creature.name} threatened the farms! ${victim.name} lost supplies.`,
-          npcIds: [victim.id],
-          causalTrace: { tick: state.tick, npcId: -1, chosenAction: 'creature_attack', topAlternatives: [], pressures: {}, modifiers: {}, diceRoll: rng(), threshold: creature.threat, success: true },
-          salience: creature.threat > 0.6 ? 0.5 : 0.3,
-          tags: ['wildlife', 'creature'],
-        });
-        
-        // Hunters may respond
-        const hunters = Array.from(state.npcs.values()).filter(n => n.alive && n.job === 'hunter');
-        if (hunters.length > 0 && rng() < 0.4) {
-          const hunter = seededChoice(rng, hunters);
-          const huntSuccess = rng() < (hunter.skills.fighting * 0.01 + hunter.skills.stealth * 0.005);
-          if (huntSuccess && creature.threat > 0.5) {
-            creature.alive = false;
-            hunter.coin += 10;
-            state.log.push({
-              id: `WL${state.nextEventId++}`, tick: state.tick,
-              year: Math.floor(state.tick / 360) + 1, day: (state.tick % 360) + 1,
-              season: ['Spring', 'Summer', 'Autumn', 'Winter'][Math.floor((state.tick % 360) / 90)],
-              type: 'wildlife', text: `${hunter.name} successfully hunted the ${creature.name}!`,
-              npcIds: [hunter.id],
-              causalTrace: { tick: state.tick, npcId: hunter.id, chosenAction: 'hunt', topAlternatives: [], pressures: {}, modifiers: {}, diceRoll: rng(), threshold: 0.5, success: true },
-              salience: 0.4,
-              tags: ['wildlife', 'hunt'],
-            });
-          }
+    // Higher threat creatures are more likely to attack
+    if (rng() < creature.threat * 0.6) {
+      const year = Math.floor(state.tick / 360) + 1;
+      const day = (state.tick % 360) + 1;
+      const season = ['Spring', 'Summer', 'Autumn', 'Winter'][Math.floor((state.tick % 360) / 90)];
+      
+      // Different effects based on creature capabilities
+      const caps = deriveCapabilities(creature.elements);
+      
+      if (creature.threat > 0.6) {
+        // Dangerous creature - may injure people
+        const targets = Array.from(state.npcs.values()).filter(n => n.alive && n.district === 'Farms');
+        if (targets.length > 0) {
+          const victim = seededChoice(rng, targets);
+          const damage = seededRandom(rng, 0.1, 0.3) * creature.threat;
+          victim.health -= damage;
+          victim.inventory.food = Math.max(0, (victim.inventory.food || 0) - seededInt(rng, 3, 10));
+          state.economy.supply.food -= seededInt(rng, 3, 8);
+          
+          // Determine attack type from capabilities
+          let attackType = 'attacked';
+          if (caps.bite_poison > 0.3) attackType = 'poisoned with its bite';
+          else if (caps.flight > 0.5) attackType = 'swooped down on';
+          else if (creature.elements.includes('venom_gland')) attackType = 'struck with venom at';
+          
+          state.log.push({
+            id: `WL${state.nextEventId++}`, tick: state.tick, year, day, season,
+            type: 'wildlife', 
+            text: `A ${creature.name} ${attackType} ${victim.name}! ${victim.name} was injured and lost supplies.`,
+            npcIds: [victim.id],
+            causalTrace: { 
+              tick: state.tick, npcId: victim.id, chosenAction: 'creature_attack', 
+              topAlternatives: [], pressures: {}, 
+              modifiers: { threat: creature.threat, elementCount: creature.elements.length },
+              diceRoll: rng(), threshold: creature.threat, success: true 
+            },
+            salience: 0.6,
+            tags: ['wildlife', 'creature', 'danger'],
+          });
+        }
+      } else {
+        // Less dangerous - crop/livestock damage
+        const farmers = Array.from(state.npcs.values()).filter(n => n.alive && (n.job === 'farmer' || n.district === 'Farms'));
+        if (farmers.length > 0) {
+          const victim = seededChoice(rng, farmers);
+          const foodLost = seededInt(rng, 2, 8);
+          victim.inventory.food = Math.max(0, (victim.inventory.food || 0) - foodLost);
+          state.economy.supply.food -= foodLost;
+          
+          state.log.push({
+            id: `WL${state.nextEventId++}`, tick: state.tick, year, day, season,
+            type: 'wildlife', 
+            text: `A ${creature.name} raided ${victim.name}'s farm, destroying ${Math.round(foodLost)} food.`,
+            npcIds: [victim.id],
+            causalTrace: { 
+              tick: state.tick, npcId: victim.id, chosenAction: 'creature_raid', 
+              topAlternatives: [], pressures: {}, 
+              modifiers: { threat: creature.threat, elementCount: creature.elements.length },
+              diceRoll: rng(), threshold: creature.threat, success: true 
+            },
+            salience: 0.4,
+            tags: ['wildlife', 'creature'],
+          });
+        }
+      }
+      
+      // Hunters/guards may respond
+      const responders = Array.from(state.npcs.values()).filter(n => n.alive && (n.job === 'hunter' || n.job === 'guard') && n.district === 'Farms');
+      if (responders.length > 0 && rng() < 0.5) {
+        const responder = seededChoice(rng, responders);
+        const huntRoll = rng();
+        const huntChance = responder.skills.fighting * 0.008 + responder.skills.stealth * 0.004;
+        if (huntRoll < huntChance) {
+          creature.alive = false;
+          responder.coin += Math.round(creature.threat * 20);
+          state.log.push({
+            id: `WL${state.nextEventId++}`, tick: state.tick, year, day, season,
+            type: 'wildlife', 
+            text: `${responder.name} tracked and killed the ${creature.name}! Earned ${Math.round(creature.threat * 20)} coin bounty.`,
+            npcIds: [responder.id],
+            causalTrace: { 
+              tick: state.tick, npcId: responder.id, chosenAction: 'hunt', 
+              topAlternatives: [], pressures: {}, modifiers: {},
+              diceRoll: huntRoll, threshold: huntChance, success: true 
+            },
+            salience: 0.5,
+            tags: ['wildlife', 'hunt'],
+          });
         }
       }
     }
@@ -1802,29 +1923,41 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
     npc.age++;
     // Age effects
     if (npc.age > 60) {
-      npc.health -= 0.02;
+      npc.health -= 0.01;
       Object.keys(npc.skills).forEach(k => {
         (npc.skills as any)[k] = Math.max(0, (npc.skills as any)[k] - 1);
       });
     }
   }
   
-  // Need decay/growth
-  npc.hunger = clamp(npc.hunger + 0.04, 0, 1);
-  npc.rest = clamp(npc.rest + 0.03, 0, 1);
-  npc.safety = clamp(npc.safety - 0.01, 0, 1);
-  npc.belonging = clamp(npc.belonging + 0.005, 0, 1);
+  // Need decay/growth - slower hunger increase
+  npc.hunger = clamp(npc.hunger + 0.03, 0, 1);
+  npc.rest = clamp(npc.rest + 0.025, 0, 1);
+  npc.safety = clamp(npc.safety - 0.005, 0, 1);
+  npc.belonging = clamp(npc.belonging + 0.003, 0, 1);
   
-  // Starvation damage
-  if (npc.hunger > 0.9) {
-    npc.health -= 0.03;
+  // Subsistence foraging: 60% daily chance if no food and no coin
+  if (npc.hunger > 0.3 && (npc.inventory.food || 0) <= 0 && npc.coin < 2) {
+    if (state.rng() < 0.6) {
+      npc.hunger = Math.max(0, npc.hunger - 0.4);
+      npc.health = Math.min(1, npc.health + 0.01);
+    }
   }
   
-  // Natural death
-  const deathChance = npc.age > 70 ? (npc.age - 70) * 0.01 : 0;
+  // Gradual starvation damage (not instant death)
+  if (npc.hunger > 0.85) {
+    npc.health -= 0.008; // Slow drain
+  }
+  if (npc.hunger > 0.95) {
+    npc.health -= 0.015; // Faster when critical
+  }
+  
+  // Natural death - only from old age or severe health loss
+  const deathChance = npc.age > 70 ? (npc.age - 70) * 0.005 : 0;
   if (state.rng() < deathChance || npc.health <= 0) {
     npc.alive = false;
     npc.health = 0;
+    // Death will be logged by logDeath in stepSimulation
   }
   
   // Relationship decay
@@ -1846,12 +1979,14 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
     }
   }
   
-  // Birth (if married and conditions met)
-  if (npc.spouseId && npc.age > 20 && npc.age < 45 && npc.sex === 'F' && state.rng() < 0.003) {
+  // Birth (if married and conditions met) - increased rate for sustainability
+  if (npc.spouseId && npc.age > 20 && npc.age < 42 && npc.sex === 'F' && state.rng() < 0.005) {
     const spouse = state.npcs.get(npc.spouseId);
     if (spouse && spouse.alive) {
       const child = createNPC(state.rng, state.nextNpcId++, 0);
       child.district = npc.district;
+      child.health = 0.9; // Healthy birth
+      child.hunger = 0.2; // Fed by mother
       // Blend traits
       for (const key of Object.keys(child.traits) as (keyof typeof child.traits)[]) {
         child.traits[key] = clamp((npc.traits[key] + spouse.traits[key]) / 2 + (state.rng() - 0.5) * 0.2, 0, 1);
@@ -1864,6 +1999,7 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
       npc.familyLinks.push({ type: 'child', npcId: child.id });
       spouse.familyLinks.push({ type: 'child', npcId: child.id });
       state.npcs.set(child.id, child);
+      state.totalBirths++;
       
       const year = Math.floor(state.tick / 360) + 1;
       state.log.push({
@@ -1872,7 +2008,7 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
         season: ['Spring', 'Summer', 'Autumn', 'Winter'][Math.floor((state.tick % 360) / 90)],
         type: 'birth', text: `${npc.name} and ${spouse.name} welcomed a child: ${child.name}.`,
         npcIds: [npc.id, spouse.id, child.id],
-        causalTrace: { tick: state.tick, npcId: npc.id, chosenAction: 'birth', topAlternatives: [], pressures: {}, modifiers: {}, diceRoll: state.rng(), threshold: 0.003, success: true },
+        causalTrace: { tick: state.tick, npcId: npc.id, chosenAction: 'birth', topAlternatives: [], pressures: {}, modifiers: {}, diceRoll: state.rng(), threshold: 0.005, success: true },
         salience: 0.5,
         tags: ['birth', 'milestone'],
       });
@@ -1884,15 +2020,21 @@ function updateNPCDaily(npc: NPC, state: SimulationState): void {
 // SECTION 11: DEATH LOGGING
 // ============================================================
 
-function logDeath(npc: NPC, state: SimulationState): void {
+function logDeath(npc: NPC, state: SimulationState, cause?: string): void {
+  // Avoid double-logging
+  if (state.deathTicks.has(npc.id)) return;
+  
   const year = Math.floor(state.tick / 360) + 1;
-  const cause = npc.health <= 0 ? (npc.hunger > 0.8 ? 'starvation' : npc.age > 65 ? 'old age' : 'illness') : 'old age';
+  const deathCause = cause || (npc.health <= 0 ? (npc.hunger > 0.8 ? 'starvation' : npc.age > 65 ? 'old age' : 'illness') : 'old age');
+  
+  state.totalDeaths++;
+  state.deathTicks.set(npc.id, state.tick);
   
   state.log.push({
     id: `D${state.nextEventId++}`, tick: state.tick, year,
     day: (state.tick % 360) + 1,
     season: ['Spring', 'Summer', 'Autumn', 'Winter'][Math.floor((state.tick % 360) / 90)],
-    type: 'death', text: `${npc.name} died at age ${npc.age} from ${cause}.`,
+    type: 'death', text: `${npc.name} died at age ${Math.round(npc.age)} from ${deathCause}.`,
     npcIds: [npc.id],
     causalTrace: { tick: state.tick, npcId: npc.id, chosenAction: 'death', topAlternatives: [], pressures: { hunger: npc.hunger, health: 1 - npc.health }, modifiers: { age: npc.age }, diceRoll: 0, threshold: 0, success: true },
     salience: 0.6,
@@ -1902,7 +2044,7 @@ function logDeath(npc: NPC, state: SimulationState): void {
   // Spouse and children react
   if (npc.spouseId) {
     const spouse = state.npcs.get(npc.spouseId);
-    if (spouse) {
+    if (spouse && spouse.alive) {
       spouse.spouseId = null;
       spouse.belonging = clamp(spouse.belonging + 0.5, 0, 1);
       addMemory(spouse, { eventId: `spouse_died_${npc.id}`, valence: -0.9, salience: 0.95, confidence: 1, source: 'witnessed', tick: state.tick });
@@ -1915,18 +2057,31 @@ function logDeath(npc: NPC, state: SimulationState): void {
 // ============================================================
 
 function detectStories(state: SimulationState): void {
-  if (state.tick % 30 !== 0) return;
+  if (state.tick % 90 !== 0) return; // Check every 90 days (seasonally)
   
   const npcs = Array.from(state.npcs.values()).filter(n => n.alive);
+  if (npcs.length === 0) return;
+  
+  // Compute pressure threshold: top 5% of population
+  const allPressures = npcs.map(npc => {
+    const pressures = computePressures(npc, state);
+    return Math.max(...Object.values(pressures));
+  }).sort((a, b) => b - a);
+  const threshold = allPressures[Math.floor(allPressures.length * 0.05)] || 0.7;
   
   for (const npc of npcs) {
     const pressures = computePressures(npc, state);
-    const sustainedPressure = Object.values(pressures).some(p => p > 0.7);
-    if (!sustainedPressure) continue;
+    const maxPressure = Math.max(...Object.values(pressures));
+    if (maxPressure < threshold) continue;
+    
+    // Deduplicate: check if NPC already has an open hook for this pattern
+    const hasHook = (pattern: string) => state.storyHooks.some(
+      h => !h.resolved && h.roles.some(r => r.npcId === npc.id) && h.pattern === pattern
+    );
     
     // Check patterns
     // HELP_SOMEONE_IN_TROUBLE
-    if (npc.traits.empathy > 0.5) {
+    if (npc.traits.empathy > 0.5 && !hasHook('HELP_SOMEONE_IN_TROUBLE')) {
       const peopleInTrouble = npcs.filter(n => n.id !== npc.id && (n.health < 0.4 || n.hunger > 0.7));
       if (peopleInTrouble.length > 0) {
         const target = peopleInTrouble[0];
@@ -1946,7 +2101,7 @@ function detectStories(state: SimulationState): void {
     }
     
     // EXPOSE_A_CRIMINAL
-    if (npc.traits.honesty > 0.5 && npc.memories.some(m => m.valence < -0.6)) {
+    if (npc.traits.honesty > 0.5 && !hasHook('EXPOSE_A_CRIMINAL') && npc.memories.some(m => m.valence < -0.6)) {
       const criminals = npcs.filter(n => n.id !== npc.id && n.crimes.some(c => !c.solved));
       if (criminals.length > 0) {
         const target = criminals[0];
@@ -1966,7 +2121,7 @@ function detectStories(state: SimulationState): void {
     }
     
     // DEAL_WITH_THREAT
-    if (npc.traits.courage > 0.5 && npc.safety > 0.4) {
+    if (npc.traits.courage > 0.5 && !hasHook('DEAL_WITH_THREAT') && npc.safety > 0.4) {
       const hook: StoryHook = {
         id: `SH${state.nextEventId++}`, tick: state.tick,
         pattern: 'DEAL_WITH_THREAT',
@@ -1982,7 +2137,7 @@ function detectStories(state: SimulationState): void {
     }
     
     // SETTLE_DISPUTE
-    if (npc.skills.persuasion > 30 && npc.relationships.some(r => r.affinity < -0.3)) {
+    if (npc.skills.persuasion > 30 && !hasHook('SETTLE_DISPUTE') && npc.relationships.some(r => r.affinity < -0.3)) {
       const enemy = npc.relationships.find(r => r.affinity < -0.3);
       if (enemy) {
         const target = state.npcs.get(enemy.targetId);
@@ -2004,7 +2159,7 @@ function detectStories(state: SimulationState): void {
     }
     
     // RECOVER_STOLEN_THING
-    if (npc.memories.some(m => m.eventId.includes('stolen') || m.eventId.includes('robbed'))) {
+    if (!hasHook('RECOVER_STOLEN_THING') && npc.memories.some(m => m.eventId.includes('stolen') || m.eventId.includes('robbed'))) {
       const theftMem = npc.memories.find(m => m.eventId.includes('stolen') || m.eventId.includes('robbed'));
       if (theftMem) {
         const hook: StoryHook = {
@@ -2052,6 +2207,10 @@ function updateStats(state: SimulationState): void {
   
   // Population
   state.stats.populationByYear.push(alive.length);
+  state.stats.minPopByYear.push(alive.length);
+  state.stats.maxPopByYear.push(alive.length);
+  state.stats.birthsByYear.push(0);
+  state.stats.deathsByYear.push(0);
   
   // Average coin
   const avgCoin = coins.length > 0 ? coins.reduce((a, b) => a + b, 0) / coins.length : 0;
@@ -2093,6 +2252,17 @@ export function stepSimulation(state: SimulationState): void {
   // Update each living NPC
   const aliveNpcs = Array.from(npcs.values()).filter(n => n.alive);
   
+  // Track population min/max this tick
+  const currentPop = aliveNpcs.length;
+  const yearIdx = Math.floor(state.tick / 360);
+  if (state.stats.minPopByYear[yearIdx] === undefined) {
+    state.stats.minPopByYear[yearIdx] = currentPop;
+    state.stats.maxPopByYear[yearIdx] = currentPop;
+  } else {
+    state.stats.minPopByYear[yearIdx] = Math.min(state.stats.minPopByYear[yearIdx], currentPop);
+    state.stats.maxPopByYear[yearIdx] = Math.max(state.stats.maxPopByYear[yearIdx], currentPop);
+  }
+  
   for (const npc of aliveNpcs) {
     try {
       // Daily needs update
@@ -2129,6 +2299,14 @@ export function stepSimulation(state: SimulationState): void {
       const chosen = scored.find(s => s.action === chosenId);
       if (!chosen) continue;
       
+      // Track action count (for health check)
+      state.actionCounts[chosenId] = (state.actionCounts[chosenId] || 0) + 1;
+      
+      // Track revenge goals
+      if (chosenId === 'seek_revenge') {
+        state.revengeGoalsCreated++;
+      }
+      
       // Determine success
       const successChance = chosen.def.successChance(npc, state);
       const roll = rng();
@@ -2138,14 +2316,19 @@ export function stepSimulation(state: SimulationState): void {
       const entry = chosen.def.execute(npc, state, success, rng);
       if (entry) {
         entry.causalTrace.tick = state.tick;
+        entry.causalTrace.diceRoll = roll; // Use the actual roll that decided success
+        entry.causalTrace.threshold = successChance;
+        entry.causalTrace.success = success;
         entry.causalTrace.topAlternatives = scored
           .filter(s => s.action !== chosenId)
           .sort((a, b) => b.score - a.score)
           .slice(0, 3)
           .map(s => ({ action: s.action, score: s.score }));
-        entry.causalTrace.diceRoll = roll;
-        entry.causalTrace.threshold = successChance;
-        state.log.push(entry);
+        
+        // Cap log size - only keep significant events
+        if (state.log.length < 60000) {
+          state.log.push(entry);
+        }
       }
     } catch (e) {
       // Defensive: skip NPC if any error occurs, log it
@@ -2292,77 +2475,161 @@ export interface TopStory {
   entries: LogEntry[];
 }
 
+export interface Storyline {
+  actors: Set<number>;
+  entries: LogEntry[];
+  startTick: number;
+  endTick: number;
+  deaths: number;
+  reversals: number;
+  revengePaidOff: boolean;
+  score: number;
+}
+
 export function generateTopStories(state: SimulationState, count: number = 20): TopStory[] {
-  // Score each log entry by salience factors
-  const scoredEntries = state.log.map(entry => {
-    let score = entry.salience;
-    // Chain length bonus
-    if (entry.tags.includes('crime')) score += 0.1;
-    if (entry.tags.includes('death')) score += 0.2;
-    if (entry.tags.includes('drama')) score += 0.15;
-    if (entry.tags.includes('milestone')) score += 0.2;
-    if (entry.tags.includes('world_event')) score += 0.1;
-    if (entry.npcIds.length > 2) score += 0.05;
-    return { entry, score };
-  });
+  // Build storylines by grouping events linked by shared actors
+  const significantEntries = state.log.filter(e => 
+    e.salience >= 0.3 || 
+    e.tags.includes('crime') || 
+    e.tags.includes('death') || 
+    e.tags.includes('drama') ||
+    e.tags.includes('revenge') ||
+    e.tags.includes('milestone') ||
+    e.tags.includes('world_event')
+  );
   
-  scoredEntries.sort((a, b) => b.score - a.score);
-  
-  // Group related entries into stories
-  const stories: TopStory[] = [];
+  // Group entries into storylines by shared NPC pairs/groups
+  const storylines: Storyline[] = [];
   const usedEntries = new Set<string>();
   
-  for (const { entry, score } of scoredEntries) {
-    if (stories.length >= count) break;
+  // Sort by tick for chronological grouping
+  const sorted = [...significantEntries].sort((a, b) => a.tick - b.tick);
+  
+  for (const entry of sorted) {
     if (usedEntries.has(entry.id)) continue;
-    if (score < 0.3) continue;
+    if (entry.npcIds.length === 0) continue;
     
-    // Find related entries (same NPCs, close in time)
-    const related = scoredEntries.filter(({ entry: e }) => 
-      !usedEntries.has(e.id) &&
-      e.npcIds.some(id => entry.npcIds.includes(id)) &&
-      Math.abs(e.tick - entry.tick) < 180
-    ).slice(0, 5);
+    // Start a new storyline
+    const storyline: Storyline = {
+      actors: new Set(entry.npcIds),
+      entries: [entry],
+      startTick: entry.tick,
+      endTick: entry.tick,
+      deaths: entry.tags.includes('death') ? 1 : 0,
+      reversals: 0,
+      revengePaidOff: entry.tags.includes('revenge') && entry.causalTrace.success,
+      score: 0,
+    };
+    usedEntries.add(entry.id);
     
-    const allEntries = [entry, ...related.map(r => r.entry)];
-    allEntries.forEach(e => usedEntries.add(e.id));
+    // Find related entries within 10 years that share actors
+    for (const other of sorted) {
+      if (usedEntries.has(other.id)) continue;
+      if (other.tick - storyline.endTick > 3600) continue; // Max 10 year span
+      if (other.tick < storyline.startTick - 360) continue; // Allow some lookback
+      
+      // Check if shares at least one actor
+      const sharedActors = other.npcIds.filter(id => storyline.actors.has(id));
+      if (sharedActors.length === 0) continue;
+      
+      // Add to storyline
+      storyline.entries.push(other);
+      usedEntries.add(other.id);
+      storyline.endTick = Math.max(storyline.endTick, other.tick);
+      other.npcIds.forEach(id => storyline.actors.add(id));
+      
+      if (other.tags.includes('death')) storyline.deaths++;
+      if (other.tags.includes('revenge') && other.causalTrace.success) storyline.revengePaidOff = true;
+    }
     
-    // Generate story paragraph
-    const mainNpc = entry.npcIds.length > 0 ? state.npcs.get(entry.npcIds[0]) : undefined;
-    const year = entry.year;
+    // Calculate storyline score
+    const lengthYears = (storyline.endTick - storyline.startTick) / 360;
+    const distinctActors = storyline.actors.size;
+    
+    // Detect reversals: check if any NPC appears on both sides of conflicts
+    const aggressors = new Set<number>();
+    const victims = new Set<number>();
+    for (const e of storyline.entries) {
+      if (e.tags.includes('violence') || e.tags.includes('crime') || e.tags.includes('revenge')) {
+        if (e.npcIds.length >= 1) aggressors.add(e.npcIds[0]);
+        if (e.npcIds.length >= 2) victims.add(e.npcIds[1]);
+      }
+    }
+    // Reversal: someone who was a victim becomes an aggressor
+    for (const id of aggressors) {
+      if (victims.has(id)) storyline.reversals++;
+    }
+    
+    storyline.score = 
+      distinctActors * 2 +
+      Math.min(lengthYears, 20) * 1.5 +
+      storyline.reversals * 5 +
+      storyline.deaths * 4 +
+      (storyline.revengePaidOff ? 8 : 0) +
+      storyline.entries.length * 0.5;
+    
+    storylines.push(storyline);
+  }
+  
+  // Sort by score
+  storylines.sort((a, b) => b.score - a.score);
+  
+  // Cap per decade (max 4 per decade)
+  const decadeCounts: Record<number, number> = {};
+  const stories: TopStory[] = [];
+  
+  for (const sl of storylines) {
+    if (stories.length >= count) break;
+    const decade = Math.floor(sl.startTick / 3600);
+    decadeCounts[decade] = (decadeCounts[decade] || 0) + 1;
+    if (decadeCounts[decade] > 4) continue;
+    
+    // Build paragraph from storyline entries
+    const actorNames = Array.from(sl.actors).map(id => {
+      const npc = state.npcs.get(id);
+      return npc?.name || `NPC#${id}`;
+    });
+    
+    const startYear = Math.floor(sl.startTick / 360) + 1;
+    const endYear = Math.floor(sl.endTick / 360) + 1;
     
     let paragraph = '';
-    if (entry.type === 'murder') {
-      const victim = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
-      paragraph = `In Year ${year}, ${mainNpc?.name || 'Unknown'} murdered ${victim?.name || 'another'}. `;
-      if (related.length > 0) {
-        paragraph += `This act of violence was preceded by mounting tension. `;
-        paragraph += related.slice(0, 2).map(r => r.entry.text).join(' ');
-      }
-    } else if (entry.type === 'marry') {
-      const spouse = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
-      paragraph = `In Year ${year}, ${mainNpc?.name || 'Unknown'} and ${spouse?.name || 'their partner'} were joined in marriage. `;
-      paragraph += `Their union brought hope to the settlement.`;
-    } else if (entry.type === 'betray') {
-      const target = entry.npcIds.length > 1 ? state.npcs.get(entry.npcIds[1]) : undefined;
-      paragraph = `In Year ${year}, trust shattered when ${mainNpc?.name || 'Unknown'} betrayed ${target?.name || 'a companion'}. `;
-      paragraph += `The wound of treachery would not heal easily.`;
-    } else if (entry.tags.includes('world_event')) {
-      paragraph = `In Year ${year}, a great event struck: ${entry.text}`;
+    // Start with the first significant event the protagonist was part of
+    const firstEntry = sl.entries[0];
+    const mainActor = state.npcs.get(firstEntry.npcIds[0]);
+    
+    if (sl.entries.length === 1) {
+      paragraph = `In Year ${startYear}, ${firstEntry.text}`;
     } else {
-      paragraph = `In Year ${year}: ${entry.text}`;
-      if (related.length > 0) {
-        paragraph += ' ' + related.slice(0, 2).map(r => r.entry.text).join(' ');
+      // Build narrative from chronological entries
+      const narrativeParts: string[] = [];
+      for (const e of sl.entries.slice(0, 6)) {
+        const eYear = Math.floor(e.tick / 360) + 1;
+        narrativeParts.push(`In Year ${eYear}, ${e.text}`);
+      }
+      paragraph = narrativeParts.join(' ');
+      if (sl.entries.length > 6) {
+        paragraph += ` ...and the saga continued through Year ${endYear}.`;
       }
     }
     
+    if (sl.revengePaidOff) {
+      paragraph += ` Revenge was finally served.`;
+    }
+    
+    const title = sl.deaths > 0 
+      ? `${mainActor?.name || 'Unknown'}'s Tale of Blood (Years ${startYear}-${endYear})`
+      : sl.reversals > 0
+      ? `The Turning Tides for ${mainActor?.name || 'Unknown'} (Years ${startYear}-${endYear})`
+      : `${mainActor?.name || 'Unknown'}'s Story (Years ${startYear}-${endYear})`;
+    
     stories.push({
       rank: stories.length + 1,
-      title: `${mainNpc?.name || 'Unknown'}'s Story (Year ${year})`,
+      title,
       paragraph,
-      salience: score,
-      npcIds: entry.npcIds,
-      entries: allEntries,
+      salience: sl.score,
+      npcIds: Array.from(sl.actors),
+      entries: sl.entries,
     });
   }
   
@@ -2414,15 +2681,13 @@ export function healthCheck(state: SimulationState): HealthFlag[] {
     flags.push({ type: 'warning', message: `High crime rate: ${crimeRate.toFixed(1)} crimes per person.` });
   }
   
-  // Action diversity
-  const actionTypes: Record<string, number> = {};
-  for (const entry of state.log) {
-    actionTypes[entry.type] = (actionTypes[entry.type] || 0) + 1;
-  }
-  const totalLog = state.log.length;
-  for (const [type, count] of Object.entries(actionTypes)) {
-    if (count / totalLog > 0.4) {
-      flags.push({ type: 'warning', message: `Action "${type}" dominates at ${(count / totalLog * 100).toFixed(0)}% of events.` });
+  // Action diversity - count ALL actions (including routine ones)
+  const totalActions = Object.values(state.actionCounts).reduce((a, b) => a + b, 0);
+  if (totalActions > 0) {
+    for (const [action, count] of Object.entries(state.actionCounts)) {
+      if (count / totalActions > 0.4) {
+        flags.push({ type: 'warning', message: `Action "${action}" dominates at ${(count / totalActions * 100).toFixed(0)}% of all decisions.` });
+      }
     }
   }
   
@@ -2458,4 +2723,119 @@ export function exportStories(stories: TopStory[]): string {
   return JSON.stringify(stories.map(s => ({
     rank: s.rank, title: s.title, paragraph: s.paragraph, salience: s.salience,
   })), null, 2);
+}
+
+// ============================================================
+// SECTION 21: SELF-TEST
+// ============================================================
+
+export interface SelfTestResult {
+  seed: number;
+  finalPop: number;
+  minPop: number;
+  maxPop: number;
+  totalBirths: number;
+  totalDeaths: number;
+  emigrated: number;
+  avgCoin: number;
+  crimesPerYear: number;
+  revengeGoalsCreated: number;
+  revengeAttacksCompleted: number;
+  distinctStorylines: number;
+  maxStorylineLengthYears: number;
+  checks: { name: string; passed: boolean; detail: string }[];
+}
+
+export function runSelfTest(seed: number): SelfTestResult {
+  const state = runSimulation(seed, 100);
+  
+  const finalPop = state.stats.populationByYear[state.stats.populationByYear.length - 1] || 0;
+  const minPop = Math.min(...state.stats.minPopByYear.filter(v => v !== undefined), finalPop);
+  const maxPop = Math.max(...state.stats.maxPopByYear.filter(v => v !== undefined), finalPop);
+  const avgCoin = state.stats.avgCoinByYear[state.stats.avgCoinByYear.length - 1] || 0;
+  const totalCrimes = state.log.filter(e => e.tags.includes('crime')).length;
+  const crimesPerYear = totalCrimes / 100;
+  
+  // Count storylines
+  const stories = generateTopStories(state, 100);
+  const distinctStorylines = stories.length;
+  const maxStorylineLengthYears = stories.length > 0 
+    ? Math.max(...stories.map(s => {
+        if (s.entries.length < 2) return 0;
+        const first = s.entries[0].tick;
+        const last = s.entries[s.entries.length - 1].tick;
+        return (last - first) / 360;
+      }))
+    : 0;
+  
+  // Check for dead NPCs appearing as actors after death
+  let deadNpcViolation = false;
+  for (const entry of state.log) {
+    for (const npcId of entry.npcIds) {
+      const deathTick = state.deathTicks.get(npcId);
+      if (deathTick !== undefined && entry.tick > deathTick) {
+        deadNpcViolation = true;
+        break;
+      }
+    }
+    if (deadNpcViolation) break;
+  }
+  
+  // Check for unfilled placeholders
+  let unfilledPlaceholders = false;
+  for (const entry of state.log) {
+    if (/\{[a-zA-Z_]+\}/.test(entry.text)) {
+      unfilledPlaceholders = true;
+      break;
+    }
+  }
+  
+  // Food price check
+  let foodPriceViolation = false;
+  for (let y = 0; y < state.stats.foodPriceByYear.length; y++) {
+    const price = state.stats.foodPriceByYear[y];
+    // Check if this was a famine year
+    const famineEvents = state.worldEvents.filter(we => we.kind === 'famine' && Math.floor(we.tick / 360) === y);
+    if (price > 6 && famineEvents.length === 0) {
+      foodPriceViolation = true;
+      break;
+    }
+  }
+  
+  // Revenge attacks where goal was created 1+ years earlier
+  const revengeAttacksLongTerm = state.log.filter(e => 
+    e.tags.includes('revenge') && e.causalTrace.success
+  ).length;
+  
+  // Storylines spanning 3+ years
+  const longStorylines = stories.filter(s => {
+    if (s.entries.length < 2) return false;
+    const first = s.entries[0].tick;
+    const last = s.entries[s.entries.length - 1].tick;
+    return (last - first) / 360 >= 3;
+  }).length;
+  
+  const checks = [
+    { name: 'min_pop >= 60', passed: minPop >= 60, detail: `min=${minPop}` },
+    { name: 'final_pop 100-400', passed: finalPop >= 100 && finalPop <= 400, detail: `final=${finalPop}` },
+    { name: 'births >= 50% deaths', passed: state.totalBirths >= state.totalDeaths * 0.5, detail: `births=${state.totalBirths}, deaths=${state.totalDeaths}` },
+    { name: 'food price <= 6 (non-famine)', passed: !foodPriceViolation, detail: foodPriceViolation ? 'price exceeded 6 outside famine' : 'OK' },
+    { name: '>= 5 revenge attacks (1yr+)', passed: revengeAttacksLongTerm >= 5, detail: `count=${revengeAttacksLongTerm}` },
+    { name: '>= 15 storylines (3yr+)', passed: longStorylines >= 15, detail: `count=${longStorylines}` },
+    { name: 'no dead NPC as actor', passed: !deadNpcViolation, detail: deadNpcViolation ? 'VIOLATION' : 'OK' },
+    { name: 'no unfilled placeholders', passed: !unfilledPlaceholders, detail: unfilledPlaceholders ? 'VIOLATION' : 'OK' },
+  ];
+  
+  return {
+    seed, finalPop, minPop, maxPop,
+    totalBirths: state.totalBirths,
+    totalDeaths: state.totalDeaths,
+    emigrated: state.emigrated,
+    avgCoin, crimesPerYear,
+    revengeGoalsCreated: state.revengeGoalsCreated,
+    revengeAttacksCompleted: state.revengeAttacksCompleted,
+    distinctStorylines,
+    maxStorylineLengthYears: Math.round(maxStorylineLengthYears * 10) / 10,
+    checks,
+  };
 }

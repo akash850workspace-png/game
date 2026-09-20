@@ -1,10 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import {
-  runSimulation, stepSimulation, initSimulation, generateTopStories,
-  healthCheck, exportLog, exportStories, coverageReport, deriveCapabilities,
-  runSelfTest, type SimulationState, type LogEntry, type TopStory, type HealthFlag, type SelfTestResult
-} from './engine';
-import { ELEMENTS } from './data';
+  runSimulation, stepSimulation, initializeWorld,
+  exportSimulation, downloadExport, generateEventLog, generateCausalChains, generateEmergentHistory,
+  type WorldState, type SimEvent, type StoryThread, type Mission
+} from './simulation-engine';
+import { detectStoryThreads, generateMissions, rankStories } from './story-engine';
 
 type Tab = 'log' | 'stories' | 'stats' | 'health' | 'trace' | 'coverage' | 'selftest';
 
